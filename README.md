@@ -14,29 +14,47 @@ The script can automate:
 ## Prerequisites
 - **AWS CLI Version 2** installed.
 - **Configured AWS Credentials** (`aws configure`) with AdministratorAccess or specific permissions to manage EC2, RDS, IAM, Lambda, and Budgets.
-- **PowerShell** environment (Windows, macOS, or Linux).
+- **PowerShell** or **Bash** environment (Windows, macOS, or Linux).
 
 ## Usage
-Simply run the script in PowerShell:
 
+### PowerShell (Windows/Cross-platform)
 ```powershell
 .\run_and_cleanup.ps1
+```
+
+### Bash (Linux/macOS)
+```bash
+chmod +x run_and_cleanup.sh
+./run_and_cleanup.sh
 ```
 
 ### Customizing Tasks (Skipping Completed Credits)
 Because AWS does not provide an API to check your Promotional Credit balance programmatically, you must manually check your AWS Billing Console to see which tasks you've already completed.
 
-To skip tasks you've already earned credits for, pass the corresponding `$false` flags:
+To skip tasks you've already earned credits for, pass the corresponding flags:
 
+**PowerShell:**
 ```powershell
 .\run_and_cleanup.ps1 -EnableEC2 $false -EnableRDS $false
 ```
 
-Available Flags:
+**Bash:**
+```bash
+./run_and_cleanup.sh --skip-ec2 --skip-rds
+```
+
+Available Flags (PowerShell):
 - `-EnableEC2` (Default: `$true`)
 - `-EnableRDS` (Default: `$true`)
 - `-EnableLambda` (Default: `$true`)
 - `-EnableBudget` (Default: `$true`)
+
+Available Flags (Bash):
+- `--skip-ec2`
+- `--skip-rds`
+- `--skip-lambda`
+- `--skip-budget`
 
 ## How it Works
 1. **Pre-flight Check**: Verifies your active `aws sts get-caller-identity` and performs dry-run permission checks.
