@@ -113,11 +113,29 @@ if ($EnableRDS) {
     try {
         Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
         $dbName = "freetier-db-$(Get-Random)"
-        aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot | Out-Null
+        # Prefer env override; otherwise generate a one-time secret (never logged in full).
+        # RDS forbids '/', '"', '@', and space in master passwords.
+        if ($env:RDS_MASTER_PASSWORD) {
+            $masterPassword = $env:RDS_MASTER_PASSWORD
+        } else {
+            $chars = (48..57) + (65..90) + (97..122) + [int[]][char[]]'!#$%&()*+,-.:;<=>?[]^_{|}~'
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $bytes = New-Object byte[] 32
+            $rng.GetBytes($bytes)
+            $masterPassword = -join ($bytes | ForEach-Object { [char]$chars[$_ % $chars.Length] })
+            $rng.Dispose()
+        }
+        aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password $masterPassword --no-publicly-accessible --skip-final-snapshot | Out-Null
+        # Password not needed for delete-db-instance cleanup; discard immediately.
+        $masterPassword = $null
+        Remove-Variable masterPassword -ErrorAction SilentlyContinue
         $createdResources.RDSId = $dbName
-        Write-Host "Created RDS Database: $dbName" -ForegroundColor Green
+        Write-Host "Created RDS Database: $dbName (master password not logged)" -ForegroundColor Green
     } catch {
-        Write-Host "Failed to create RDS database: $($_.Exception.Message)" -ForegroundColor Red
+        # Avoid printing exception text that might echo CLI args containing the password.
+        Write-Host "Failed to create RDS database." -ForegroundColor Red
+        $masterPassword = $null
+        Remove-Variable masterPassword -ErrorAction SilentlyContinue
     }
 }
 
