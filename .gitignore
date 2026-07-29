@@ -1,0 +1,9 @@
+# Local idempotent run state (resource IDs / task completion)
+.aws-freetier-state.json
+
+# Temp artifacts created by the automation scripts
+trust-policy.json
+main.py
+lambda.zip
+config.txt
+profiles.txt
