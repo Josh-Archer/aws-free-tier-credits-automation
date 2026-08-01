@@ -6,10 +6,6 @@ Provisions resources required to claim the AWS new account free tier credits nat
 AWS updated its new account Free Tier (as of mid-2025) to provide up to $100 in earned credits.
 This script uses the AWS CLI directly to spin up resources, pauses, and then cleans them up.
 
-Cleanup always runs via try/finally so mid-run failures or early exit still attempt destruction.
-Created resources are tracked as soon as each create succeeds. Failed cleanup prints remaining
-resource IDs for manual deletion.
-
 .PARAMETER EnableEC2
 Set to $false to skip launching an EC2 instance. Default is $true.
 
@@ -22,6 +18,18 @@ Set to $false to skip building a Lambda function. Default is $true.
 .PARAMETER EnableBudget
 Set to $false to skip setting an AWS Cost Budget. Default is $true.
 
+.PARAMETER WaitMinutes
+Minutes to wait after provisioning (and optional readiness poll) so AWS billing can register activity before cleanup.
+Default is 10. Three minutes is often too short; 10–15 is recommended.
+
+.PARAMETER PollReady
+When set, poll EC2/RDS until they reach a ready state (with exponential backoff) before the billing wait.
+Helps ensure short-lived resources are fully provisioned so billing can see them.
+
+.PARAMETER MaxPollMinutes
+Maximum minutes to spend polling for resource readiness when -PollReady is used. Default is 20.
+Prevents infinite hang if a resource never becomes ready.
+
 .PARAMETER AutoCheck
 Throws a warning that AWS API does not support programmatic checking of promotional credits.
 #>
@@ -32,6 +40,11 @@ param (
     [bool]$EnableRDS = $true,
     [bool]$EnableLambda = $true,
     [bool]$EnableBudget = $true,
+    [ValidateRange(1, 180)]
+    [int]$WaitMinutes = 10,
+    [switch]$PollReady,
+    [ValidateRange(1, 120)]
+    [int]$MaxPollMinutes = 20,
     [switch]$AutoCheck
 )
 
@@ -75,9 +88,9 @@ if ($EnableLambda) {
     catch { Write-Host "  [FAIL] Lambda Read Permissions" -ForegroundColor Red; $failedChecks++ }
 }
 if ($EnableBudget) {
-    try {
+    try { 
         $acc = aws sts get-caller-identity --query "Account" --output text
-        aws budgets describe-budgets --account-id $acc --max-items 1 --output json | Out-Null; Write-Host "  [OK] Budget Read Permissions" -ForegroundColor Green
+        aws budgets describe-budgets --account-id $acc --max-items 1 --output json | Out-Null; Write-Host "  [OK] Budget Read Permissions" -ForegroundColor Green 
     }
     catch { Write-Host "  [FAIL] Budget Read Permissions" -ForegroundColor Red; $failedChecks++ }
 }
@@ -88,230 +101,181 @@ if ($failedChecks -gt 0) {
 
 Write-Host "`nStarting AWS Free Tier Credit Automation..." -ForegroundColor Cyan
 Write-Host "Enabled Tasks: EC2=$EnableEC2, RDS=$EnableRDS, Lambda=$EnableLambda, Budget=$EnableBudget"
+Write-Host "Wait: ${WaitMinutes}m | PollReady=$PollReady | MaxPollMinutes=$MaxPollMinutes"
 
-# Track each resource as soon as create succeeds so partial runs still clean up.
 $createdResources = @{
-    InstanceId     = $null
-    RDSId          = $null
+    InstanceId = $null
+    RDSId = $null
     LambdaRoleName = $null
-    LambdaName     = $null
-    BudgetName     = $null
+    LambdaName = $null
+    BudgetName = $null
 }
 
-$scriptFailed = $false
-$cleanupFailed = $false
+# --- PROVISIONING ---
+Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
 
-function Get-RemainingResources {
-    $remaining = @()
-    if ($createdResources.InstanceId)     { $remaining += "EC2 InstanceId: $($createdResources.InstanceId)" }
-    if ($createdResources.RDSId)          { $remaining += "RDS DB Identifier: $($createdResources.RDSId)" }
-    if ($createdResources.LambdaName)     { $remaining += "Lambda Function: $($createdResources.LambdaName)" }
-    if ($createdResources.LambdaRoleName) { $remaining += "IAM Role: $($createdResources.LambdaRoleName)" }
-    if ($createdResources.BudgetName)     { $remaining += "Budget Name: $($createdResources.BudgetName)" }
-    return $remaining
+if ($EnableEC2) {
+    try {
+        Write-Host "Fetching latest Amazon Linux 2 AMI..."
+        $ami = aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text
+        Write-Host "Launching EC2 instance (t2.micro) with AMI $ami..."
+        $instanceId = aws ec2 run-instances --image-id $ami --instance-type t2.micro --query "Instances[0].InstanceId" --output text
+        $createdResources.InstanceId = $instanceId
+        Write-Host "Created EC2 Instance: $instanceId" -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to create EC2 instance: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 
-function Invoke-Cleanup {
-    Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
-    $localCleanupFailed = $false
-    $account = $identity.Account
+if ($EnableRDS) {
+    try {
+        Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
+        $dbName = "freetier-db-$(Get-Random)"
+        aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot | Out-Null
+        $createdResources.RDSId = $dbName
+        Write-Host "Created RDS Database: $dbName" -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to create RDS database: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
 
-    if ($createdResources.InstanceId) {
-        Write-Host "Terminating EC2 Instance: $($createdResources.InstanceId)..."
+if ($EnableLambda) {
+    try {
+        Write-Host "Creating Lambda Role and Function..."
+        $roleName = "freetier-role-$(Get-Random)"
+        $funcName = "freetier-func-$(Get-Random)"
+        
+        $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
+        $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
+        aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
+        
+        # Wait for role to propagate
+        Start-Sleep -Seconds 10
+        
+        $lambdaCode = "def lambda_handler(event, context): return 'Hello Free Tier'"
+        $lambdaCode | Out-File -FilePath main.py -Encoding ascii
+        Compress-Archive -Path main.py -DestinationPath lambda.zip -Force
+        
+        $account = $identity.Account
+        aws lambda create-function --function-name $funcName --runtime python3.12 --role arn:aws:iam::${account}:role/$roleName --handler main.lambda_handler --zip-file fileb://lambda.zip | Out-Null
+        
+        $createdResources.LambdaRoleName = $roleName
+        $createdResources.LambdaName = $funcName
+        Write-Host "Created Lambda: $funcName" -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to create Lambda: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+if ($EnableBudget) {
+    try {
+        Write-Host "Creating AWS Budget..."
+        $budgetName = "freetier-budget-$(Get-Random)"
+        $account = $identity.Account
+        $budgetDef = '{"BudgetName":"' + $budgetName + '","BudgetLimit":{"Amount":"10","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}'
+        aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers "[]" | Out-Null
+        $createdResources.BudgetName = $budgetName
+        Write-Host "Created Budget: $budgetName" -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to create Budget: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# --- OPTIONAL READINESS POLL (bounded exponential backoff) ---
+function Wait-WithBackoff {
+    param(
+        [string]$Label,
+        [scriptblock]$IsReady,
+        [int]$MaxSeconds
+    )
+    $delay = 15
+    $elapsed = 0
+    $maxDelay = 120
+
+    Write-Host "  Polling $Label (max ${MaxSeconds}s, backoff ${delay}s..${maxDelay}s)..." -ForegroundColor Cyan
+    while ($elapsed -lt $MaxSeconds) {
         try {
-            aws ec2 terminate-instances --instance-ids $createdResources.InstanceId | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            Write-Host "Destroyed EC2." -ForegroundColor Green
-            $createdResources.InstanceId = $null
+            if (& $IsReady) {
+                Write-Host "  [OK] $Label ready after ~${elapsed}s" -ForegroundColor Green
+                return $true
+            }
         } catch {
-            Write-Host "Failed to terminate EC2 $($createdResources.InstanceId): $($_.Exception.Message)" -ForegroundColor Red
-            $localCleanupFailed = $true
+            # Treat probe errors as not-ready; continue until budget exhausted
         }
+        $sleepFor = [Math]::Min($delay, $MaxSeconds - $elapsed)
+        if ($sleepFor -le 0) { break }
+        Write-Host "    $Label not ready yet; sleeping ${sleepFor}s (elapsed ${elapsed}s)..." -ForegroundColor DarkYellow
+        Start-Sleep -Seconds $sleepFor
+        $elapsed += $sleepFor
+        $delay = [Math]::Min($delay * 2, $maxDelay)
     }
-
-    if ($createdResources.RDSId) {
-        Write-Host "Deleting RDS Database: $($createdResources.RDSId)..."
-        try {
-            aws rds delete-db-instance --db-instance-identifier $createdResources.RDSId --skip-final-snapshot | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            Write-Host "Destroyed RDS." -ForegroundColor Green
-            $createdResources.RDSId = $null
-        } catch {
-            Write-Host "Failed to delete RDS $($createdResources.RDSId): $($_.Exception.Message)" -ForegroundColor Red
-            $localCleanupFailed = $true
-        }
-    }
-
-    if ($createdResources.LambdaName) {
-        Write-Host "Deleting Lambda Function: $($createdResources.LambdaName)..."
-        try {
-            aws lambda delete-function --function-name $createdResources.LambdaName | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            Write-Host "Destroyed Lambda function." -ForegroundColor Green
-            $createdResources.LambdaName = $null
-        } catch {
-            Write-Host "Failed to delete Lambda $($createdResources.LambdaName): $($_.Exception.Message)" -ForegroundColor Red
-            $localCleanupFailed = $true
-        }
-    }
-
-    if ($createdResources.LambdaRoleName) {
-        Write-Host "Deleting IAM Role: $($createdResources.LambdaRoleName)..."
-        try {
-            aws iam delete-role --role-name $createdResources.LambdaRoleName | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            Write-Host "Destroyed IAM role." -ForegroundColor Green
-            $createdResources.LambdaRoleName = $null
-        } catch {
-            Write-Host "Failed to delete IAM role $($createdResources.LambdaRoleName): $($_.Exception.Message)" -ForegroundColor Red
-            $localCleanupFailed = $true
-        }
-    }
-
-    if ($createdResources.BudgetName) {
-        Write-Host "Deleting Budget: $($createdResources.BudgetName)..."
-        try {
-            aws budgets delete-budget --account-id $account --budget-name $createdResources.BudgetName | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            Write-Host "Destroyed Budget." -ForegroundColor Green
-            $createdResources.BudgetName = $null
-        } catch {
-            Write-Host "Failed to delete Budget $($createdResources.BudgetName): $($_.Exception.Message)" -ForegroundColor Red
-            $localCleanupFailed = $true
-        }
-    }
-
-    # Always remove local temp artifacts
-    Remove-Item -ErrorAction SilentlyContinue -Force trust-policy.json, main.py, lambda.zip, config.txt, profiles.txt
-
-    $remaining = Get-RemainingResources
-    if ($remaining.Count -gt 0) {
-        Write-Host "`n=======================================================" -ForegroundColor Red
-        Write-Host "CLEANUP INCOMPLETE - manually delete remaining resources:" -ForegroundColor Red
-        Write-Host "=======================================================" -ForegroundColor Red
-        foreach ($item in $remaining) {
-            Write-Host "  - $item" -ForegroundColor Red
-        }
-        Write-Host "=======================================================" -ForegroundColor Red
-        return $true
-    }
-
-    if ($localCleanupFailed) {
-        return $true
-    }
-
-    Write-Host "Cleanup completed; no tracked resources remain." -ForegroundColor Green
+    Write-Host "  [WARN] $Label not ready within ${MaxSeconds}s; continuing to billing wait/cleanup." -ForegroundColor Yellow
     return $false
 }
 
-try {
-    # --- PROVISIONING ---
-    Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
+if ($PollReady) {
+    Write-Host "`n=== POLLING RESOURCE READINESS ===" -ForegroundColor Cyan
+    $maxPollSeconds = $MaxPollMinutes * 60
 
-    if ($EnableEC2) {
-        try {
-            Write-Host "Fetching latest Amazon Linux 2 AMI..."
-            $ami = aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text
-            if ($LASTEXITCODE -ne 0) { throw "Failed to describe images (aws exit $LASTEXITCODE)" }
-            Write-Host "Launching EC2 instance (t2.micro) with AMI $ami..."
-            $instanceId = aws ec2 run-instances --image-id $ami --instance-type t2.micro --query "Instances[0].InstanceId" --output text
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($instanceId) -or $instanceId -eq "None") {
-                throw "Failed to launch instance (aws exit $LASTEXITCODE)"
-            }
-            # Track immediately so cleanup runs even if later steps fail.
-            $createdResources.InstanceId = $instanceId
-            Write-Host "Created EC2 Instance: $instanceId" -ForegroundColor Green
-        } catch {
-            Write-Host "Failed to create EC2 instance: $($_.Exception.Message)" -ForegroundColor Red
-            $scriptFailed = $true
-        }
+    if ($createdResources.InstanceId) {
+        $instanceId = $createdResources.InstanceId
+        Wait-WithBackoff -Label "EC2 $instanceId" -MaxSeconds $maxPollSeconds -IsReady {
+            $state = aws ec2 describe-instances --instance-ids $instanceId --query "Reservations[0].Instances[0].State.Name" --output text 2>$null
+            return ($state -eq "running")
+        } | Out-Null
     }
 
-    if ($EnableRDS) {
-        try {
-            Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
-            $dbName = "freetier-db-$(Get-Random)"
-            aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            $createdResources.RDSId = $dbName
-            Write-Host "Created RDS Database: $dbName" -ForegroundColor Green
-        } catch {
-            Write-Host "Failed to create RDS database: $($_.Exception.Message)" -ForegroundColor Red
-            $scriptFailed = $true
-        }
+    if ($createdResources.RDSId) {
+        $rdsId = $createdResources.RDSId
+        Wait-WithBackoff -Label "RDS $rdsId" -MaxSeconds $maxPollSeconds -IsReady {
+            $status = aws rds describe-db-instances --db-instance-identifier $rdsId --query "DBInstances[0].DBInstanceStatus" --output text 2>$null
+            return ($status -eq "available")
+        } | Out-Null
     }
 
-    if ($EnableLambda) {
-        try {
-            Write-Host "Creating Lambda Role and Function..."
-            $roleName = "freetier-role-$(Get-Random)"
-            $funcName = "freetier-func-$(Get-Random)"
-
-            $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
-            $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
-            aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create IAM role (aws exit $LASTEXITCODE)" }
-            # Track role immediately (function create can still fail).
-            $createdResources.LambdaRoleName = $roleName
-            Write-Host "Created IAM Role: $roleName" -ForegroundColor Green
-
-            # Wait for role to propagate
-            Start-Sleep -Seconds 10
-
-            $lambdaCode = "def lambda_handler(event, context): return 'Hello Free Tier'"
-            $lambdaCode | Out-File -FilePath main.py -Encoding ascii
-            Compress-Archive -Path main.py -DestinationPath lambda.zip -Force
-
-            $account = $identity.Account
-            aws lambda create-function --function-name $funcName --runtime python3.12 --role arn:aws:iam::${account}:role/$roleName --handler main.lambda_handler --zip-file fileb://lambda.zip | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Failed to create Lambda function (aws exit $LASTEXITCODE)" }
-            $createdResources.LambdaName = $funcName
-            Write-Host "Created Lambda: $funcName" -ForegroundColor Green
-        } catch {
-            Write-Host "Failed to create Lambda: $($_.Exception.Message)" -ForegroundColor Red
-            $scriptFailed = $true
-        }
+    if (-not $createdResources.InstanceId -and -not $createdResources.RDSId) {
+        Write-Host "  No EC2/RDS resources to poll; skipping readiness wait." -ForegroundColor DarkYellow
     }
-
-    if ($EnableBudget) {
-        try {
-            Write-Host "Creating AWS Budget..."
-            $budgetName = "freetier-budget-$(Get-Random)"
-            $account = $identity.Account
-            $budgetDef = '{"BudgetName":"' + $budgetName + '","BudgetLimit":{"Amount":"10","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}'
-            aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers "[]" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "aws exit code $LASTEXITCODE" }
-            $createdResources.BudgetName = $budgetName
-            Write-Host "Created Budget: $budgetName" -ForegroundColor Green
-        } catch {
-            Write-Host "Failed to create Budget: $($_.Exception.Message)" -ForegroundColor Red
-            $scriptFailed = $true
-        }
-    }
-
-    # --- WAITING ---
-    Write-Host "`n=======================================================" -ForegroundColor Yellow
-    Write-Host "Provisioning phase complete!"
-    Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
-    Start-Sleep -Seconds 180
-    Write-Host "=======================================================" -ForegroundColor Yellow
-} catch {
-    Write-Host "Unexpected error during provisioning/wait: $($_.Exception.Message)" -ForegroundColor Red
-    $scriptFailed = $true
-} finally {
-    # Always attempt cleanup, including after partial creates or mid-run errors.
-    $cleanupFailed = Invoke-Cleanup
 }
 
-if ($cleanupFailed) {
-    Write-Host "`nAutomation finished with CLEANUP FAILURES. Review remaining resources above." -ForegroundColor Red
-    exit 2
+# --- BILLING REGISTRATION WAIT ---
+$waitSeconds = $WaitMinutes * 60
+Write-Host "`n=======================================================" -ForegroundColor Yellow
+Write-Host "Provisioning phase complete!"
+Write-Host "Waiting $WaitMinutes minute(s) for AWS billing to register activity..." -ForegroundColor Yellow
+Write-Host "Note: Promotional credits can take 24-48 hours to appear in Billing." -ForegroundColor Yellow
+Write-Host "=======================================================" -ForegroundColor Yellow
+Start-Sleep -Seconds $waitSeconds
+Write-Host "Billing registration wait finished." -ForegroundColor Yellow
+
+# --- CLEANUP ---
+Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
+
+if ($createdResources.InstanceId) {
+    Write-Host "Terminating EC2 Instance: $($createdResources.InstanceId)..."
+    aws ec2 terminate-instances --instance-ids $($createdResources.InstanceId) | Out-Null
+    Write-Host "Destroyed EC2." -ForegroundColor Green
 }
 
-if ($scriptFailed) {
-    Write-Host "`nAutomation finished with provisioning errors, but cleanup reported no remaining tracked resources." -ForegroundColor Yellow
-    exit 1
+if ($createdResources.RDSId) {
+    Write-Host "Deleting RDS Database: $($createdResources.RDSId)..."
+    aws rds delete-db-instance --db-instance-identifier $($createdResources.RDSId) --skip-final-snapshot | Out-Null
+    Write-Host "Destroyed RDS." -ForegroundColor Green
+}
+
+if ($createdResources.LambdaName) {
+    Write-Host "Deleting Lambda Function: $($createdResources.LambdaName)..."
+    aws lambda delete-function --function-name $($createdResources.LambdaName) | Out-Null
+    aws iam delete-role --role-name $($createdResources.LambdaRoleName) | Out-Null
+    Write-Host "Destroyed Lambda." -ForegroundColor Green
+}
+
+if ($createdResources.BudgetName) {
+    Write-Host "Deleting Budget: $($createdResources.BudgetName)..."
+    $account = $identity.Account
+    aws budgets delete-budget --account-id $account --budget-name $($createdResources.BudgetName) | Out-Null
+    Write-Host "Destroyed Budget." -ForegroundColor Green
 }
 
 Write-Host "`nAutomation Finished Successfully!" -ForegroundColor Green
-exit 0
+Write-Host "Remember: credits may take 24-48 hours to show in the Billing Dashboard." -ForegroundColor Yellow
