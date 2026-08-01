@@ -1,271 +1,293 @@
 #!/bin/bash
+# Orchestrates modular free-tier task plugins from tasks/catalog.json + tasks/plugins/*.sh
 
-# --- DEFAULTS ---
-ENABLE_EC2=true
-ENABLE_RDS=true
-ENABLE_LAMBDA=true
-ENABLE_BUDGET=true
-AUTO_CHECK=false
-DRY_RUN=false
+set -euo pipefail
 
-# --- USAGE ---
-usage() {
-    echo "Usage: $0 [options]"
-    echo ""
-    echo "Options:"
-    echo "  --skip-ec2      Skip EC2 instance creation"
-    echo "  --skip-rds      Skip RDS database creation"
-    echo "  --skip-lambda   Skip Lambda function creation"
-    echo "  --skip-budget   Skip Budget creation"
-    echo "  --auto-check    Display info about AWS credit checking limitations"
-    echo "  --dry-run       Print exact AWS CLI invocations without creating/deleting resources"
-    echo "  --help          Display this help message"
-    exit 1
-}
-
-# --- ARGUMENT PARSING ---
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --skip-ec2) ENABLE_EC2=false ;;
-        --skip-rds) ENABLE_RDS=false ;;
-        --skip-lambda) ENABLE_LAMBDA=false ;;
-        --skip-budget) ENABLE_BUDGET=false ;;
-        --auto-check) AUTO_CHECK=true ;;
-        --dry-run) DRY_RUN=true ;;
-        --help) usage ;;
-        *) echo "Unknown parameter passed: $1"; usage ;;
-    esac
-    shift
-done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CATALOG_PATH="${SCRIPT_DIR}/tasks/catalog.json"
+PLUGINS_DIR="${SCRIPT_DIR}/tasks/plugins"
 
 # --- UTILS ---
 log_info() { echo -e "\033[0;36m$1\033[0m"; }
 log_success() { echo -e "\033[0;32m$1\033[0m"; }
 log_warn() { echo -e "\033[0;33m$1\033[0m"; }
 log_error() { echo -e "\033[0;31m$1\033[0m"; }
-log_dry() { echo -e "\033[0;35m[DRY-RUN] $1\033[0m"; }
+
+# --- CATALOG / TASK DISCOVERY ---
+if [ ! -f "$CATALOG_PATH" ]; then
+    log_error "Task catalog not found: $CATALOG_PATH"
+    exit 1
+fi
+
+# Requires python3 or jq for JSON; prefer python3 for portability of list parsing
+read_catalog_field() {
+    local field=$1
+    if command -v jq >/dev/null 2>&1; then
+        jq -r ".$field" "$CATALOG_PATH"
+    else
+        python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('$field',''))" "$CATALOG_PATH"
+    fi
+}
+
+list_task_ids() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.tasks[].id' "$CATALOG_PATH"
+    else
+        python3 -c "import json,sys; [print(t['id']) for t in json.load(open(sys.argv[1]))['tasks']]" "$CATALOG_PATH"
+    fi
+}
+
+task_default_enabled() {
+    local id=$1
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg id "$id" '.tasks[] | select(.id==$id) | .default_enabled' "$CATALOG_PATH"
+    else
+        python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(next(t['default_enabled'] for t in c['tasks'] if t['id']==sys.argv[2]))" "$CATALOG_PATH" "$id"
+    fi
+}
+
+task_meta() {
+    local id=$1
+    if command -v jq >/dev/null 2>&1; then
+        jq -r --arg id "$id" '.tasks[] | select(.id==$id) | "\(.name)\t\(.credit_usd)\t\(.description)"' "$CATALOG_PATH"
+    else
+        python3 -c "
+import json,sys
+c=json.load(open(sys.argv[1]))
+t=next(x for x in c['tasks'] if x['id']==sys.argv[2])
+print(f\"{t['name']}\t{t['credit_usd']}\t{t['description']}\")
+" "$CATALOG_PATH" "$id"
+    fi
+}
+
+mapfile -t ALL_TASK_IDS < <(list_task_ids)
+
+# Build default enable map
+declare -A ENABLE
+for id in "${ALL_TASK_IDS[@]}"; do
+    def=$(task_default_enabled "$id")
+    if [ "$def" = "true" ] || [ "$def" = "True" ]; then
+        ENABLE[$id]=true
+    else
+        ENABLE[$id]=false
+    fi
+done
+
+ONLY_SET=false
+AUTO_CHECK=false
+LIST_TASKS=false
+
+usage() {
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Modular free-tier task runner. Tasks are defined in tasks/catalog.json"
+    echo "and implemented as plugins under tasks/plugins/."
+    echo ""
+    echo "Options:"
+    for id in "${ALL_TASK_IDS[@]}"; do
+        printf "  --skip-%-8s Skip task: %s\n" "$id" "$id"
+    done
+    echo "  --only IDS      Comma-separated task ids to run exclusively (e.g. ec2,lambda)"
+    echo "  --list-tasks    List catalog tasks (id, credit, description) and exit"
+    echo "  --auto-check    Display info about AWS credit checking limitations"
+    echo "  --help          Display this help message"
+    exit 1
+}
+
+list_tasks() {
+    local last_verified
+    last_verified=$(read_catalog_field last_verified)
+    local program
+    program=$(read_catalog_field program)
+    echo "Program: $program"
+    echo "Last verified: $last_verified"
+    echo ""
+    printf "%-12s %-8s %-10s %s\n" "ID" "DEFAULT" "CREDIT" "DESCRIPTION"
+    printf "%-12s %-8s %-10s %s\n" "------------" "--------" "----------" "-----------"
+    for id in "${ALL_TASK_IDS[@]}"; do
+        local meta name credit desc def
+        meta=$(task_meta "$id")
+        name=$(echo "$meta" | cut -f1)
+        credit=$(echo "$meta" | cut -f2)
+        desc=$(echo "$meta" | cut -f3)
+        def=$(task_default_enabled "$id")
+        printf "%-12s %-8s \$%-9s %s\n" "$id" "$def" "$credit" "$desc"
+    done
+    echo ""
+    echo "Enable/skip: --skip-<id> or --only id1,id2"
+}
+
+# --- ARGUMENT PARSING ---
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --help) usage ;;
+        --auto-check) AUTO_CHECK=true ;;
+        --list-tasks) LIST_TASKS=true ;;
+        --only)
+            shift
+            if [[ $# -eq 0 ]]; then
+                log_error "--only requires a comma-separated list of task ids"
+                exit 1
+            fi
+            ONLY_SET=true
+            for id in "${ALL_TASK_IDS[@]}"; do ENABLE[$id]=false; done
+            IFS=',' read -ra ONLY_IDS <<< "$1"
+            for oid in "${ONLY_IDS[@]}"; do
+                oid=$(echo "$oid" | xargs)
+                if [[ -z "${ENABLE[$oid]+x}" ]]; then
+                    log_error "Unknown task id in --only: $oid"
+                    echo "Known tasks: ${ALL_TASK_IDS[*]}"
+                    exit 1
+                fi
+                ENABLE[$oid]=true
+            done
+            ;;
+        --only=*)
+            ONLY_SET=true
+            for id in "${ALL_TASK_IDS[@]}"; do ENABLE[$id]=false; done
+            IFS=',' read -ra ONLY_IDS <<< "${1#*=}"
+            for oid in "${ONLY_IDS[@]}"; do
+                oid=$(echo "$oid" | xargs)
+                if [[ -z "${ENABLE[$oid]+x}" ]]; then
+                    log_error "Unknown task id in --only: $oid"
+                    exit 1
+                fi
+                ENABLE[$oid]=true
+            done
+            ;;
+        --skip-*)
+            sid="${1#--skip-}"
+            if [[ -z "${ENABLE[$sid]+x}" ]]; then
+                log_error "Unknown task to skip: $sid"
+                echo "Known tasks: ${ALL_TASK_IDS[*]}"
+                exit 1
+            fi
+            ENABLE[$sid]=false
+            ;;
+        *)
+            echo "Unknown parameter passed: $1"
+            usage
+            ;;
+    esac
+    shift
+done
+
+if [ "$LIST_TASKS" = true ]; then
+    list_tasks
+    exit 0
+fi
 
 if [ "$AUTO_CHECK" = true ]; then
     echo "======================================================="
     log_warn "AUTO-CHECK LIMITATION"
     echo "======================================================="
     echo "AWS does not provide a public API or CLI command to retrieve your Promotional Credit balance."
-    echo "Please use the AWS Billing Console to verify your credits and use the --skip flags to skip the ones you already have."
+    echo "Please use the AWS Billing Console to verify your credits and use --skip-<id> or --only to control tasks."
+    echo "Catalog last verified: $(read_catalog_field last_verified)"
     echo "======================================================="
     exit 0
 fi
 
-if [ "$DRY_RUN" = true ]; then
-    echo "======================================================="
-    log_dry "MODE: printing AWS CLI calls only (no side effects)"
-    echo "======================================================="
-fi
+# --- LOAD PLUGINS ---
+for id in "${ALL_TASK_IDS[@]}"; do
+    plugin_file="${PLUGINS_DIR}/${id}.sh"
+    if [ ! -f "$plugin_file" ]; then
+        log_error "Missing plugin for task '$id': $plugin_file"
+        exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$plugin_file"
+done
 
 # --- IDENTITY CHECK ---
 log_info "Verifying AWS CLI Identity..."
-if [ "$DRY_RUN" = true ]; then
-    log_dry 'aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json'
-    ACCOUNT_ID="<ACCOUNT_ID>"
-    USER_ARN="arn:aws:iam::<ACCOUNT_ID>:user/<USER>"
-    echo "Account: $ACCOUNT_ID"
-    echo "User Arn: $USER_ARN"
+IDENTITY=$(aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json 2>/dev/null) || {
+    log_error "Error: Unable to verify AWS identity. Please run 'aws configure' first."
+    exit 1
+}
+
+if command -v jq >/dev/null 2>&1; then
+    ACCOUNT_ID=$(echo "$IDENTITY" | jq -r .Account)
+    USER_ARN=$(echo "$IDENTITY" | jq -r .Arn)
 else
-    IDENTITY=$(aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json 2>/dev/null)
-    if [ $? -ne 0 ]; then
-        log_error "Error: Unable to verify AWS identity. Please run 'aws configure' first."
-        exit 1
-    fi
-
-    ACCOUNT_ID=$(echo $IDENTITY | grep -oP '(?<="Account": ")[^"]*')
-    USER_ARN=$(echo $IDENTITY | grep -oP '(?<="Arn": ")[^"]*')
-
-    echo "Account: $ACCOUNT_ID"
-    echo "User Arn: $USER_ARN"
+    ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import json,sys; print(json.load(sys.stdin)['Account'])")
+    USER_ARN=$(echo "$IDENTITY" | python3 -c "import json,sys; print(json.load(sys.stdin)['Arn'])")
 fi
+
+echo "Account: $ACCOUNT_ID"
+echo "User Arn: $USER_ARN"
+echo "Catalog last verified: $(read_catalog_field last_verified)"
 
 # --- PRE-FLIGHT PERMISSION CHECK ---
-if [ "$DRY_RUN" = true ]; then
-    log_info "\n[DRY-RUN] Skipping pre-flight permission checks (read-only probes not shown)."
-else
-    log_info "\nRunning Pre-flight Permission Checks..."
-    FAILED_CHECKS=0
+log_info "\nRunning Pre-flight Permission Checks..."
+FAILED_CHECKS=0
 
-    check_perm() {
-        local service=$1
-        local cmd=$2
-        if eval "$cmd" >/dev/null 2>&1; then
-            log_success "  [OK] $service Read Permissions"
+for id in "${ALL_TASK_IDS[@]}"; do
+    if [ "${ENABLE[$id]}" = true ]; then
+        check_fn="task_${id}_check_perm"
+        if declare -f "$check_fn" >/dev/null; then
+            if "$check_fn"; then
+                log_success "  [OK] $id Read Permissions"
+            else
+                log_error "  [FAIL] $id Read Permissions"
+                FAILED_CHECKS=$((FAILED_CHECKS + 1))
+            fi
         else
-            log_error "  [FAIL] $service Read Permissions"
-            ((FAILED_CHECKS++))
+            log_warn "  [SKIP] $id has no check_perm hook"
         fi
-    }
-
-    [ "$ENABLE_EC2" = true ] && check_perm "EC2" "aws ec2 describe-regions --max-items 1"
-    [ "$ENABLE_RDS" = true ] && check_perm "RDS" "aws rds describe-db-instances --max-items 1"
-    [ "$ENABLE_LAMBDA" = true ] && check_perm "Lambda" "aws lambda list-functions --max-items 1"
-    [ "$ENABLE_BUDGET" = true ] && check_perm "Budget" "aws budgets describe-budgets --account-id $ACCOUNT_ID --max-items 1"
-
-    if [ $FAILED_CHECKS -gt 0 ]; then
-        log_warn "\nWarning: $FAILED_CHECKS permission check(s) failed. If you proceed, the script will likely fail to create resources."
     fi
+done
+
+if [ "$FAILED_CHECKS" -gt 0 ]; then
+    log_warn "\nWarning: $FAILED_CHECKS permission check(s) failed. If you proceed, the script will likely fail to create resources."
 fi
 
+ENABLED_LIST=""
+for id in "${ALL_TASK_IDS[@]}"; do
+    ENABLED_LIST+="${id}=${ENABLE[$id]} "
+done
 log_info "\nStarting AWS Free Tier Credit Automation..."
-echo "Enabled Tasks: EC2=$ENABLE_EC2, RDS=$ENABLE_RDS, Lambda=$ENABLE_LAMBDA, Budget=$ENABLE_BUDGET"
-
-INSTANCE_ID=""
-RDS_ID=""
-LAMBDA_ROLE=""
-LAMBDA_NAME=""
-BUDGET_NAME=""
+echo "Enabled Tasks: $ENABLED_LIST"
 
 # --- PROVISIONING ---
 log_info "\n=== PROVISIONING RESOURCES ==="
+PROVISIONED_IDS=()
 
-if [ "$ENABLE_EC2" = true ]; then
-    log_info "Fetching latest Amazon Linux 2 AMI..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry 'aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text'
-        AMI="<AMI_ID>"
-    else
-        AMI=$(aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text)
+for id in "${ALL_TASK_IDS[@]}"; do
+    if [ "${ENABLE[$id]}" = true ]; then
+        provision_fn="task_${id}_provision"
+        if declare -f "$provision_fn" >/dev/null; then
+            if "$provision_fn"; then
+                PROVISIONED_IDS+=("$id")
+            else
+                log_error "Provisioning failed for task: $id"
+            fi
+        else
+            log_error "Plugin missing provision function: $provision_fn"
+        fi
     fi
-    log_info "Launching EC2 instance (t2.micro) with AMI $AMI..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws ec2 run-instances --image-id $AMI --instance-type t2.micro --query \"Instances[0].InstanceId\" --output text"
-        INSTANCE_ID="i-0123456789abcdef0"
-    else
-        INSTANCE_ID=$(aws ec2 run-instances --image-id $AMI --instance-type t2.micro --query "Instances[0].InstanceId" --output text)
-    fi
-    log_success "Created EC2 Instance: $INSTANCE_ID"
-fi
-
-if [ "$ENABLE_RDS" = true ]; then
-    log_info "Creating RDS Database (db.t3.micro MySQL)..."
-    if [ "$DRY_RUN" = true ]; then
-        RDS_ID="freetier-db-<random>"
-    else
-        RDS_ID="freetier-db-$RANDOM"
-    fi
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws rds create-db-instance --db-instance-identifier $RDS_ID --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password \"FreeTierPassword123!\" --no-publicly-accessible --skip-final-snapshot"
-    else
-        aws rds create-db-instance --db-instance-identifier $RDS_ID --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot >/dev/null
-    fi
-    log_success "Created RDS Database: $RDS_ID"
-fi
-
-if [ "$ENABLE_LAMBDA" = true ]; then
-    log_info "Creating Lambda Role and Function..."
-    if [ "$DRY_RUN" = true ]; then
-        ROLE_NAME="freetier-role-<random>"
-        LAMBDA_NAME="freetier-func-<random>"
-        log_dry "aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json"
-        log_dry "(would wait ~10s for IAM role propagation)"
-        log_dry "(would write main.py and lambda.zip packaging steps)"
-        log_dry "aws lambda create-function --function-name $LAMBDA_NAME --runtime python3.12 --role arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME --handler main.lambda_handler --zip-file fileb://lambda.zip"
-        LAMBDA_ROLE=$ROLE_NAME
-    else
-        ROLE_NAME="freetier-role-$RANDOM"
-        LAMBDA_NAME="freetier-func-$RANDOM"
-
-        TRUST_POLICY='{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
-        echo "$TRUST_POLICY" > trust-policy.json
-        aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document file://trust-policy.json >/dev/null
-
-        # Wait for role to propagate
-        sleep 10
-
-        echo "def lambda_handler(event, context): return 'Hello Free Tier'" > main.py
-        zip -q lambda.zip main.py
-
-        aws lambda create-function --function-name $LAMBDA_NAME --runtime python3.12 --role arn:aws:iam::${ACCOUNT_ID}:role/$ROLE_NAME --handler main.lambda_handler --zip-file fileb://lambda.zip >/dev/null
-
-        LAMBDA_ROLE=$ROLE_NAME
-    fi
-    log_success "Created Lambda: $LAMBDA_NAME"
-fi
-
-if [ "$ENABLE_BUDGET" = true ]; then
-    log_info "Creating AWS Budget..."
-    if [ "$DRY_RUN" = true ]; then
-        BUDGET_NAME="freetier-budget-<random>"
-    else
-        BUDGET_NAME="freetier-budget-$RANDOM"
-    fi
-    BUDGET_DEF="{\"BudgetName\":\"$BUDGET_NAME\",\"BudgetLimit\":{\"Amount\":\"10\",\"Unit\":\"USD\"},\"TimeUnit\":\"MONTHLY\",\"BudgetType\":\"COST\"}"
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws budgets create-budget --account-id $ACCOUNT_ID --budget $BUDGET_DEF --notifications-with-subscribers \"[]\""
-    else
-        aws budgets create-budget --account-id $ACCOUNT_ID --budget "$BUDGET_DEF" --notifications-with-subscribers "[]" >/dev/null
-    fi
-    log_success "Created Budget: $BUDGET_NAME"
-fi
+done
 
 # --- WAITING ---
 echo -e "\n======================================================="
 log_warn "Provisioning phase complete!"
-if [ "$DRY_RUN" = true ]; then
-    log_dry "Skipping 3-minute wait for AWS billing registration."
-else
-    log_warn "Waiting 3 minutes for AWS to register the activity..."
-    sleep 180
-fi
+log_warn "Waiting 3 minutes for AWS to register the activity..."
+sleep 180
 echo "======================================================="
 
 # --- CLEANUP ---
 log_info "\n=== CLEANING UP RESOURCES ==="
 
-if [ -n "$INSTANCE_ID" ]; then
-    log_info "Terminating EC2 Instance: $INSTANCE_ID..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws ec2 terminate-instances --instance-ids $INSTANCE_ID"
-    else
-        aws ec2 terminate-instances --instance-ids $INSTANCE_ID >/dev/null
+# Cleanup in reverse order of provision
+for ((i=${#PROVISIONED_IDS[@]}-1; i>=0; i--)); do
+    id="${PROVISIONED_IDS[$i]}"
+    cleanup_fn="task_${id}_cleanup"
+    if declare -f "$cleanup_fn" >/dev/null; then
+        "$cleanup_fn" || log_warn "Cleanup reported an error for task: $id"
     fi
-    log_success "Destroyed EC2."
-fi
+done
 
-if [ -n "$RDS_ID" ]; then
-    log_info "Deleting RDS Database: $RDS_ID..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws rds delete-db-instance --db-instance-identifier $RDS_ID --skip-final-snapshot"
-    else
-        aws rds delete-db-instance --db-instance-identifier $RDS_ID --skip-final-snapshot >/dev/null
-    fi
-    log_success "Destroyed RDS."
-fi
+# Residual temp files from plugins
+rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
 
-if [ -n "$LAMBDA_NAME" ]; then
-    log_info "Deleting Lambda Function: $LAMBDA_NAME..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws lambda delete-function --function-name $LAMBDA_NAME"
-        log_dry "aws iam delete-role --role-name $LAMBDA_ROLE"
-    else
-        aws lambda delete-function --function-name $LAMBDA_NAME >/dev/null
-        aws iam delete-role --role-name $LAMBDA_ROLE >/dev/null
-    fi
-    log_success "Destroyed Lambda."
-fi
-
-if [ -n "$BUDGET_NAME" ]; then
-    log_info "Deleting Budget: $BUDGET_NAME..."
-    if [ "$DRY_RUN" = true ]; then
-        log_dry "aws budgets delete-budget --account-id $ACCOUNT_ID --budget-name $BUDGET_NAME"
-    else
-        aws budgets delete-budget --account-id $ACCOUNT_ID --budget-name $BUDGET_NAME >/dev/null
-    fi
-    log_success "Destroyed Budget."
-fi
-
-# Cleanup temp files (only if they were created)
-if [ "$DRY_RUN" != true ]; then
-    rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
-fi
-
-if [ "$DRY_RUN" = true ]; then
-    log_success "\nDry-run finished. No AWS resources were created or deleted."
-else
-    log_success "\nAutomation Finished Successfully!"
-fi
+log_success "\nAutomation Finished Successfully!"

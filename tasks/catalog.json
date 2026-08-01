@@ -1,0 +1,39 @@
+{
+  "program": "AWS Free Tier earned credits (new accounts)",
+  "last_verified": "2026-07-28",
+  "notes": "Task list and credit amounts change when AWS updates the free-tier credits program. Re-verify against the AWS Free Tier / Billing console before relying on this catalog. Add new entries under tasks/ and drop matching plugins into tasks/plugins/.",
+  "tasks": [
+    {
+      "id": "ec2",
+      "name": "EC2 instance launch",
+      "description": "Launch an Amazon Linux 2 t2.micro instance",
+      "credit_usd": 20.0,
+      "default_enabled": true,
+      "plugin": "ec2"
+    },
+    {
+      "id": "rds",
+      "name": "RDS database",
+      "description": "Create a MySQL db.t3.micro instance (20 GiB)",
+      "credit_usd": 20.0,
+      "default_enabled": true,
+      "plugin": "rds"
+    },
+    {
+      "id": "lambda",
+      "name": "Lambda function",
+      "description": "Deploy a minimal Python 3.12 serverless function",
+      "credit_usd": 20.0,
+      "default_enabled": true,
+      "plugin": "lambda"
+    },
+    {
+      "id": "budget",
+      "name": "AWS Budgets",
+      "description": "Create a $10 monthly cost budget",
+      "credit_usd": 20.0,
+      "default_enabled": true,
+      "plugin": "budget"
+    }
+  ]
+}

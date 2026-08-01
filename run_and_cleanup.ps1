@@ -1,28 +1,34 @@
 <#
 .SYNOPSIS
-Provisions resources required to claim the AWS new account free tier credits natively via AWS CLI, waits, and then destroys them.
+Provisions resources required to claim the AWS new account free tier credits via modular task plugins, waits, and then destroys them.
 
 .DESCRIPTION
-AWS updated its new account Free Tier (as of mid-2025) to provide up to $100 in earned credits.
-This script uses the AWS CLI directly to spin up resources, pauses, and then cleans them up.
+AWS updated its new account Free Tier (as of mid-2025) to provide earned credits for exploration tasks.
+Tasks are defined in tasks/catalog.json and implemented under tasks/plugins/*.ps1 so coverage can expand when the program changes.
 
 .PARAMETER EnableEC2
-Set to $false to skip launching an EC2 instance. Default is $true.
+Legacy switch: set to $false to skip EC2. Prefer -Skip / -Only for new task ids.
 
 .PARAMETER EnableRDS
-Set to $false to skip creating an RDS database. Default is $true.
+Legacy switch: set to $false to skip RDS.
 
 .PARAMETER EnableLambda
-Set to $false to skip building a Lambda function. Default is $true.
+Legacy switch: set to $false to skip Lambda.
 
 .PARAMETER EnableBudget
-Set to $false to skip setting an AWS Cost Budget. Default is $true.
+Legacy switch: set to $false to skip Budget.
+
+.PARAMETER Skip
+Array of task ids to skip (e.g. -Skip ec2,rds).
+
+.PARAMETER Only
+If set, only these task ids run (e.g. -Only lambda,budget).
+
+.PARAMETER ListTasks
+List catalog tasks (id, credit, description, last verified) and exit.
 
 .PARAMETER AutoCheck
 Throws a warning that AWS API does not support programmatic checking of promotional credits.
-
-.PARAMETER DryRun
-Print the exact AWS CLI invocations that would run without creating or deleting any resources.
 #>
 
 [CmdletBinding()]
@@ -31,248 +37,230 @@ param (
     [bool]$EnableRDS = $true,
     [bool]$EnableLambda = $true,
     [bool]$EnableBudget = $true,
-    [switch]$AutoCheck,
-    [switch]$DryRun
+    [string[]]$Skip = @(),
+    [string[]]$Only = @(),
+    [switch]$ListTasks,
+    [switch]$AutoCheck
 )
 
 $ErrorActionPreference = "Stop"
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$CatalogPath = Join-Path $ScriptDir "tasks\catalog.json"
+$PluginsDir = Join-Path $ScriptDir "tasks\plugins"
+
+if (-not (Test-Path $CatalogPath)) {
+    Write-Host "Task catalog not found: $CatalogPath" -ForegroundColor Red
+    exit 1
+}
+
+$catalog = Get-Content -Raw -Path $CatalogPath | ConvertFrom-Json
+$allTasks = @($catalog.tasks)
+
+# Plugin function map: id -> @{ Check; Provision; Cleanup }
+# Loaded after sourcing plugin files. Ids must match catalog.json.
+$script:TaskPluginMap = @{}
+
+# Dot-source each plugin listed in the catalog
+foreach ($task in $allTasks) {
+    $pluginFile = Join-Path $PluginsDir "$($task.plugin).ps1"
+    if (-not (Test-Path $pluginFile)) {
+        Write-Host "Missing plugin for task '$($task.id)': $pluginFile" -ForegroundColor Red
+        exit 1
+    }
+    . $pluginFile
+}
+
+# Register known plugins (id -> function names). New plugins: add entry here + catalog row + .ps1 file.
+$script:TaskPluginMap = @{
+    ec2 = @{
+        Check     = { Invoke-TaskEc2Check }
+        Provision = { Invoke-TaskEc2Provision }
+        Cleanup   = { param($s) Invoke-TaskEc2Cleanup -State $s }
+    }
+    rds = @{
+        Check     = { Invoke-TaskRdsCheck }
+        Provision = { Invoke-TaskRdsProvision }
+        Cleanup   = { param($s) Invoke-TaskRdsCleanup -State $s }
+    }
+    lambda = @{
+        Check     = { Invoke-TaskLambdaCheck }
+        Provision = { Invoke-TaskLambdaProvision }
+        Cleanup   = { param($s) Invoke-TaskLambdaCleanup -State $s }
+    }
+    budget = @{
+        Check     = { Invoke-TaskBudgetCheck }
+        Provision = { Invoke-TaskBudgetProvision }
+        Cleanup   = { param($s) Invoke-TaskBudgetCleanup -State $s }
+    }
+}
+
+function Show-TaskList {
+    Write-Host "Program: $($catalog.program)"
+    Write-Host "Last verified: $($catalog.last_verified)"
+    Write-Host ""
+    Write-Host ("{0,-12} {1,-8} {2,-10} {3}" -f "ID", "DEFAULT", "CREDIT", "DESCRIPTION")
+    Write-Host ("{0,-12} {1,-8} {2,-10} {3}" -f "------------", "--------", "----------", "-----------")
+    foreach ($t in $allTasks) {
+        Write-Host ("{0,-12} {1,-8} `${2,-9} {3}" -f $t.id, $t.default_enabled, $t.credit_usd, $t.description)
+    }
+    Write-Host ""
+    Write-Host "Enable/skip: -Skip id1,id2  |  -Only id1,id2  |  legacy -EnableEC2:`$false etc."
+}
+
+if ($ListTasks) {
+    Show-TaskList
+    exit 0
+}
 
 if ($AutoCheck) {
     Write-Host "=======================================================" -ForegroundColor Yellow
     Write-Host "AUTO-CHECK LIMITATION" -ForegroundColor Yellow
     Write-Host "=======================================================" -ForegroundColor Yellow
     Write-Host "AWS does not provide a public API or CLI command to retrieve your Promotional Credit balance."
-    Write-Host "Please use the AWS Billing Console to verify your credits and use the Enable* flags to skip the ones you already have."
+    Write-Host "Please use the AWS Billing Console and -Skip / -Only (or -Enable* flags) to control tasks."
+    Write-Host "Catalog last verified: $($catalog.last_verified)"
     Write-Host "=======================================================" -ForegroundColor Yellow
-    exit
+    exit 0
 }
 
-if ($DryRun) {
-    Write-Host "=======================================================" -ForegroundColor Magenta
-    Write-Host "DRY-RUN MODE: printing AWS CLI calls only (no side effects)" -ForegroundColor Magenta
-    Write-Host "=======================================================" -ForegroundColor Magenta
+# Resolve which tasks are enabled
+$enabled = @{}
+foreach ($t in $allTasks) {
+    $enabled[$t.id] = [bool]$t.default_enabled
 }
 
-# --- IDENTITY CHECK ---
-Write-Host "Verifying AWS CLI Identity..." -ForegroundColor Cyan
-if ($DryRun) {
-    Write-Host "[DRY-RUN] aws sts get-caller-identity --query `"{Account:Account, Arn:Arn}`" --output json" -ForegroundColor Magenta
-    $identity = [pscustomobject]@{ Account = "<ACCOUNT_ID>"; Arn = "arn:aws:iam::<ACCOUNT_ID>:user/<USER>" }
-    Write-Host "Account: $($identity.Account)"
-    Write-Host "User Arn: $($identity.Arn)"
-} else {
-    try {
-        $identity = aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json | ConvertFrom-Json
-        Write-Host "Account: $($identity.Account)"
-        Write-Host "User Arn: $($identity.Arn)"
-    } catch {
-        Write-Host "Error: Unable to verify AWS identity. Please run 'aws configure' first." -ForegroundColor Red
+# Legacy bool flags (keep backward compatibility)
+$legacyMap = @{
+    ec2    = $EnableEC2
+    rds    = $EnableRDS
+    lambda = $EnableLambda
+    budget = $EnableBudget
+}
+foreach ($k in $legacyMap.Keys) {
+    if ($enabled.ContainsKey($k) -and -not $legacyMap[$k]) {
+        $enabled[$k] = $false
+    }
+}
+
+function Expand-TaskIdArgs {
+    param([string[]]$Values)
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($v in $Values) {
+        foreach ($part in ($v -split ',')) {
+            $id = $part.Trim()
+            if ($id) { $result.Add($id) | Out-Null }
+        }
+    }
+    return ,$result.ToArray()
+}
+
+# -Skip takes precedence for listed ids
+foreach ($sid in (Expand-TaskIdArgs -Values $Skip)) {
+    if (-not $enabled.ContainsKey($sid)) {
+        Write-Host "Unknown task id in -Skip: $sid" -ForegroundColor Red
+        Write-Host "Known: $($enabled.Keys -join ', ')"
+        exit 1
+    }
+    $enabled[$sid] = $false
+}
+
+# -Only: exclusive set
+$onlyIds = Expand-TaskIdArgs -Values $Only
+if ($onlyIds.Count -gt 0) {
+    foreach ($k in @($enabled.Keys)) { $enabled[$k] = $false }
+    foreach ($oid in $onlyIds) {
+        if (-not $enabled.ContainsKey($oid)) {
+            Write-Host "Unknown task id in -Only: $oid" -ForegroundColor Red
+            exit 1
+        }
+        $enabled[$oid] = $true
+    }
+}
+
+# Validate plugin map coverage for enabled tasks
+foreach ($t in $allTasks) {
+    if ($enabled[$t.id] -and -not $script:TaskPluginMap.ContainsKey($t.id)) {
+        Write-Host "No plugin map entry for enabled task '$($t.id)'. Add it to TaskPluginMap in run_and_cleanup.ps1." -ForegroundColor Red
         exit 1
     }
 }
 
+# --- IDENTITY CHECK ---
+Write-Host "Verifying AWS CLI Identity..." -ForegroundColor Cyan
+try {
+    $identity = aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json | ConvertFrom-Json
+    Write-Host "Account: $($identity.Account)"
+    Write-Host "User Arn: $($identity.Arn)"
+    Write-Host "Catalog last verified: $($catalog.last_verified)"
+} catch {
+    Write-Host "Error: Unable to verify AWS identity. Please run 'aws configure' first." -ForegroundColor Red
+    exit 1
+}
+
+$script:TaskAccountId = $identity.Account
+
 # --- PRE-FLIGHT PERMISSION CHECK ---
-if (-not $DryRun) {
-    Write-Host "`nRunning Pre-flight Permission Checks..." -ForegroundColor Cyan
-    $failedChecks = 0
+Write-Host "`nRunning Pre-flight Permission Checks..." -ForegroundColor Cyan
+$failedChecks = 0
 
-    if ($EnableEC2) {
-        try { aws ec2 describe-regions --max-items 1 --output json | Out-Null; Write-Host "  [OK] EC2 Read Permissions" -ForegroundColor Green }
-        catch { Write-Host "  [FAIL] EC2 Read Permissions" -ForegroundColor Red; $failedChecks++ }
+foreach ($t in $allTasks) {
+    if (-not $enabled[$t.id]) { continue }
+    $plugin = $script:TaskPluginMap[$t.id]
+    try {
+        & $plugin.Check
+        Write-Host "  [OK] $($t.id) Read Permissions" -ForegroundColor Green
+    } catch {
+        Write-Host "  [FAIL] $($t.id) Read Permissions" -ForegroundColor Red
+        $failedChecks++
     }
-    if ($EnableRDS) {
-        try { aws rds describe-db-instances --max-items 1 --output json | Out-Null; Write-Host "  [OK] RDS Read Permissions" -ForegroundColor Green }
-        catch { Write-Host "  [FAIL] RDS Read Permissions" -ForegroundColor Red; $failedChecks++ }
-    }
-    if ($EnableLambda) {
-        try { aws lambda list-functions --max-items 1 --output json | Out-Null; Write-Host "  [OK] Lambda Read Permissions" -ForegroundColor Green }
-        catch { Write-Host "  [FAIL] Lambda Read Permissions" -ForegroundColor Red; $failedChecks++ }
-    }
-    if ($EnableBudget) {
-        try {
-            $acc = aws sts get-caller-identity --query "Account" --output text
-            aws budgets describe-budgets --account-id $acc --max-items 1 --output json | Out-Null; Write-Host "  [OK] Budget Read Permissions" -ForegroundColor Green
-        }
-        catch { Write-Host "  [FAIL] Budget Read Permissions" -ForegroundColor Red; $failedChecks++ }
-    }
-
-    if ($failedChecks -gt 0) {
-        Write-Host "`nWarning: $failedChecks permission check(s) failed. If you proceed, the script will likely fail to create resources." -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "`n[DRY-RUN] Skipping pre-flight permission checks (read-only probes not shown)." -ForegroundColor Magenta
 }
 
+if ($failedChecks -gt 0) {
+    Write-Host "`nWarning: $failedChecks permission check(s) failed. If you proceed, the script will likely fail to create resources." -ForegroundColor Yellow
+}
+
+$enabledSummary = ($allTasks | ForEach-Object { "$($_.id)=$($enabled[$_.id])" }) -join ", "
 Write-Host "`nStarting AWS Free Tier Credit Automation..." -ForegroundColor Cyan
-Write-Host "Enabled Tasks: EC2=$EnableEC2, RDS=$EnableRDS, Lambda=$EnableLambda, Budget=$EnableBudget"
+Write-Host "Enabled Tasks: $enabledSummary"
 
-$createdResources = @{
-    InstanceId = $null
-    RDSId = $null
-    LambdaRoleName = $null
-    LambdaName = $null
-    BudgetName = $null
-}
+$taskStates = @{}   # id -> state hashtable from provision
+$provisionedOrder = New-Object System.Collections.Generic.List[string]
 
 # --- PROVISIONING ---
 Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
 
-if ($EnableEC2) {
+foreach ($t in $allTasks) {
+    if (-not $enabled[$t.id]) { continue }
+    $plugin = $script:TaskPluginMap[$t.id]
     try {
-        Write-Host "Fetching latest Amazon Linux 2 AMI..."
-        if ($DryRun) {
-            Write-Host '[DRY-RUN] aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text' -ForegroundColor Magenta
-            $ami = "<AMI_ID>"
-        } else {
-            $ami = aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" --query "sort_by(Images, &CreationDate)[-1].ImageId" --output text
-        }
-        Write-Host "Launching EC2 instance (t2.micro) with AMI $ami..."
-        if ($DryRun) {
-            Write-Host "[DRY-RUN] aws ec2 run-instances --image-id $ami --instance-type t2.micro --query `"Instances[0].InstanceId`" --output text" -ForegroundColor Magenta
-            $instanceId = "i-0123456789abcdef0"
-        } else {
-            $instanceId = aws ec2 run-instances --image-id $ami --instance-type t2.micro --query "Instances[0].InstanceId" --output text
-        }
-        $createdResources.InstanceId = $instanceId
-        Write-Host "Created EC2 Instance: $instanceId" -ForegroundColor Green
+        $state = & $plugin.Provision
+        if ($null -eq $state) { $state = @{} }
+        $taskStates[$t.id] = $state
+        $provisionedOrder.Add($t.id) | Out-Null
     } catch {
-        Write-Host "Failed to create EC2 instance: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-if ($EnableRDS) {
-    try {
-        Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
-        $dbName = if ($DryRun) { "freetier-db-<random>" } else { "freetier-db-$(Get-Random)" }
-        $rdsCmd = "aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password `"FreeTierPassword123!`" --no-publicly-accessible --skip-final-snapshot"
-        if ($DryRun) {
-            Write-Host "[DRY-RUN] $rdsCmd" -ForegroundColor Magenta
-        } else {
-            aws rds create-db-instance --db-instance-identifier $dbName --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot | Out-Null
-        }
-        $createdResources.RDSId = $dbName
-        Write-Host "Created RDS Database: $dbName" -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to create RDS database: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-if ($EnableLambda) {
-    try {
-        Write-Host "Creating Lambda Role and Function..."
-        $roleName = if ($DryRun) { "freetier-role-<random>" } else { "freetier-role-$(Get-Random)" }
-        $funcName = if ($DryRun) { "freetier-func-<random>" } else { "freetier-func-$(Get-Random)" }
-
-        if (-not $DryRun) {
-            $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
-            $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
-        }
-
-        if ($DryRun) {
-            Write-Host "[DRY-RUN] aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json" -ForegroundColor Magenta
-            Write-Host "[DRY-RUN] (would wait ~10s for IAM role propagation)" -ForegroundColor Magenta
-            Write-Host "[DRY-RUN] (would write main.py and lambda.zip packaging steps)" -ForegroundColor Magenta
-        } else {
-            aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
-            # Wait for role to propagate
-            Start-Sleep -Seconds 10
-            $lambdaCode = "def lambda_handler(event, context): return 'Hello Free Tier'"
-            $lambdaCode | Out-File -FilePath main.py -Encoding ascii
-            Compress-Archive -Path main.py -DestinationPath lambda.zip -Force
-        }
-
-        $account = $identity.Account
-        if ($DryRun) {
-            Write-Host "[DRY-RUN] aws lambda create-function --function-name $funcName --runtime python3.12 --role arn:aws:iam::${account}:role/$roleName --handler main.lambda_handler --zip-file fileb://lambda.zip" -ForegroundColor Magenta
-        } else {
-            aws lambda create-function --function-name $funcName --runtime python3.12 --role arn:aws:iam::${account}:role/$roleName --handler main.lambda_handler --zip-file fileb://lambda.zip | Out-Null
-        }
-
-        $createdResources.LambdaRoleName = $roleName
-        $createdResources.LambdaName = $funcName
-        Write-Host "Created Lambda: $funcName" -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to create Lambda: $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
-
-if ($EnableBudget) {
-    try {
-        Write-Host "Creating AWS Budget..."
-        $budgetName = if ($DryRun) { "freetier-budget-<random>" } else { "freetier-budget-$(Get-Random)" }
-        $account = $identity.Account
-        $budgetDef = '{"BudgetName":"' + $budgetName + '","BudgetLimit":{"Amount":"10","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}'
-        if ($DryRun) {
-            Write-Host "[DRY-RUN] aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers `"[]`"" -ForegroundColor Magenta
-        } else {
-            aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers "[]" | Out-Null
-        }
-        $createdResources.BudgetName = $budgetName
-        Write-Host "Created Budget: $budgetName" -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to create Budget: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Failed to provision task '$($t.id)': $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
 # --- WAITING ---
 Write-Host "`n=======================================================" -ForegroundColor Yellow
 Write-Host "Provisioning phase complete!"
-if ($DryRun) {
-    Write-Host "[DRY-RUN] Skipping 3-minute wait for AWS billing registration." -ForegroundColor Magenta
-} else {
-    Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
-    Start-Sleep -Seconds 180
-}
+Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
+Start-Sleep -Seconds 180
 Write-Host "=======================================================" -ForegroundColor Yellow
 
 # --- CLEANUP ---
 Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
 
-if ($createdResources.InstanceId) {
-    Write-Host "Terminating EC2 Instance: $($createdResources.InstanceId)..."
-    if ($DryRun) {
-        Write-Host "[DRY-RUN] aws ec2 terminate-instances --instance-ids $($createdResources.InstanceId)" -ForegroundColor Magenta
-    } else {
-        aws ec2 terminate-instances --instance-ids $($createdResources.InstanceId) | Out-Null
+for ($i = $provisionedOrder.Count - 1; $i -ge 0; $i--) {
+    $id = $provisionedOrder[$i]
+    $plugin = $script:TaskPluginMap[$id]
+    try {
+        & $plugin.Cleanup $taskStates[$id]
+    } catch {
+        Write-Host "Cleanup error for task '$id': $($_.Exception.Message)" -ForegroundColor Yellow
     }
-    Write-Host "Destroyed EC2." -ForegroundColor Green
 }
 
-if ($createdResources.RDSId) {
-    Write-Host "Deleting RDS Database: $($createdResources.RDSId)..."
-    if ($DryRun) {
-        Write-Host "[DRY-RUN] aws rds delete-db-instance --db-instance-identifier $($createdResources.RDSId) --skip-final-snapshot" -ForegroundColor Magenta
-    } else {
-        aws rds delete-db-instance --db-instance-identifier $($createdResources.RDSId) --skip-final-snapshot | Out-Null
-    }
-    Write-Host "Destroyed RDS." -ForegroundColor Green
-}
-
-if ($createdResources.LambdaName) {
-    Write-Host "Deleting Lambda Function: $($createdResources.LambdaName)..."
-    if ($DryRun) {
-        Write-Host "[DRY-RUN] aws lambda delete-function --function-name $($createdResources.LambdaName)" -ForegroundColor Magenta
-        Write-Host "[DRY-RUN] aws iam delete-role --role-name $($createdResources.LambdaRoleName)" -ForegroundColor Magenta
-    } else {
-        aws lambda delete-function --function-name $($createdResources.LambdaName) | Out-Null
-        aws iam delete-role --role-name $($createdResources.LambdaRoleName) | Out-Null
-    }
-    Write-Host "Destroyed Lambda." -ForegroundColor Green
-}
-
-if ($createdResources.BudgetName) {
-    Write-Host "Deleting Budget: $($createdResources.BudgetName)..."
-    $account = $identity.Account
-    if ($DryRun) {
-        Write-Host "[DRY-RUN] aws budgets delete-budget --account-id $account --budget-name $($createdResources.BudgetName)" -ForegroundColor Magenta
-    } else {
-        aws budgets delete-budget --account-id $account --budget-name $($createdResources.BudgetName) | Out-Null
-    }
-    Write-Host "Destroyed Budget." -ForegroundColor Green
-}
-
-if ($DryRun) {
-    Write-Host "`nDry-run finished. No AWS resources were created or deleted." -ForegroundColor Magenta
-} else {
-    Write-Host "`nAutomation Finished Successfully!" -ForegroundColor Green
-}
+Write-Host "`nAutomation Finished Successfully!" -ForegroundColor Green
