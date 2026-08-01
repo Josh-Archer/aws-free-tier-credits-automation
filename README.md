@@ -49,55 +49,104 @@ Available Flags (PowerShell):
 - `-EnableRDS` (Default: `$true`)
 - `-EnableLambda` (Default: `$true`)
 - `-EnableBudget` (Default: `$true`)
-- `-WaitMinutes <int>` (Default: `10`) — billing registration wait before cleanup
-- `-PollReady` — optionally poll EC2/RDS readiness with exponential backoff before the wait
-- `-MaxPollMinutes <int>` (Default: `20`) — ceiling for readiness polling (avoids infinite hang)
+- `-StateFile` (optional path; see [State file](#state-file-idempotent-re-runs))
+- `-ResetState` (delete state and start clean)
+- `-Force` (re-run tasks even if marked completed)
 
 Available Flags (Bash):
 - `--skip-ec2`
 - `--skip-rds`
 - `--skip-lambda`
 - `--skip-budget`
-- `--wait-minutes N` (Default: `10`)
-- `--poll-ready`
-- `--max-poll-minutes N` (Default: `20`)
+- `--state-file PATH`
+- `--reset-state`
+- `--force`
 
-### Wait duration and billing registration
+## State file (idempotent re-runs)
 
-A short fixed wait (for example 3 minutes) is often **not enough** for AWS billing systems to register resource activity before cleanup. Defaults are therefore longer and configurable.
+The scripts persist progress in a local JSON **state file** so re-runs are safe by default:
 
-| Setting | Recommended | Notes |
-|--------|-------------|--------|
-| Billing wait (`WaitMinutes` / `--wait-minutes`) | **10–15 minutes** | Default is **10**. Raise if runs still fail to earn credits. |
-| Readiness poll (`PollReady` / `--poll-ready`) | Optional, useful with RDS | Polls EC2 → `running` and RDS → `available` with backoff. |
-| Poll ceiling (`MaxPollMinutes` / `--max-poll-minutes`) | **15–20 minutes** | Caps polling so the script never hangs forever. |
+- Resource IDs (EC2 instance, RDS identifier, Lambda function/role, Budget name) are written as soon as resources are created.
+- Each task is marked `completed` after successful cleanup.
+- On the next run, **completed tasks are skipped** unless you force or reset.
+- If a previous run was interrupted after provisioning, the next run **resumes cleanup** using the saved IDs instead of creating duplicates.
 
-**Examples:**
+### Default path
+
+| Platform   | Default state file path |
+|-----------|--------------------------|
+| Either    | `.aws-freetier-state.json` in the same directory as the script |
+
+Override with:
 
 ```powershell
-# Longer billing wait only
-.\run_and_cleanup.ps1 -WaitMinutes 15
-
-# Wait for EC2/RDS to become ready, then 12 minutes for billing
-.\run_and_cleanup.ps1 -PollReady -WaitMinutes 12 -MaxPollMinutes 20
+.\run_and_cleanup.ps1 -StateFile "C:\path\to\my-state.json"
 ```
 
 ```bash
-# Longer billing wait only
-./run_and_cleanup.sh --wait-minutes 15
-
-# Wait for EC2/RDS to become ready, then 12 minutes for billing
-./run_and_cleanup.sh --poll-ready --wait-minutes 12 --max-poll-minutes 20
+./run_and_cleanup.sh --state-file /path/to/my-state.json
 ```
 
-> **Credit lag:** Allow **24–48 hours** for promotional credits to appear in the AWS Billing Dashboard after a successful run. Re-running too soon can create duplicate resources or confuse which tasks already counted—check Billing first and use skip flags for credits you already earned.
+### State schema (overview)
+
+```json
+{
+  "version": 1,
+  "accountId": "123456789012",
+  "updatedAt": "2026-07-28T12:00:00Z",
+  "tasks": {
+    "ec2": { "status": "completed", "instanceId": "i-...", "completedAt": "..." },
+    "rds": { "status": "completed", "dbInstanceId": "freetier-db-...", "completedAt": "..." },
+    "lambda": { "status": "completed", "functionName": "...", "roleName": "...", "completedAt": "..." },
+    "budget": { "status": "completed", "budgetName": "...", "completedAt": "..." }
+  }
+}
+```
+
+Task `status` values: `pending` → `provisioned` → `completed`.
+
+### Resetting state
+
+To clear all recorded progress and treat every task as incomplete again:
+
+```powershell
+.\run_and_cleanup.ps1 -ResetState
+```
+
+```bash
+./run_and_cleanup.sh --reset-state
+```
+
+To re-run tasks that are already marked completed **without** deleting the file:
+
+```powershell
+.\run_and_cleanup.ps1 -Force
+```
+
+```bash
+./run_and_cleanup.sh --force
+```
+
+You can also delete the state file manually:
+
+```powershell
+Remove-Item .\.aws-freetier-state.json   # path next to the script
+```
+
+```bash
+rm .aws-freetier-state.json
+```
+
+> The state file is local and may contain AWS resource identifiers for your account. Do not commit it to version control.
 
 ## How it Works
 1. **Pre-flight Check**: Verifies your active `aws sts get-caller-identity` and performs dry-run permission checks.
-2. **Provisioning**: Creates the enabled resources natively via the `aws` CLI.
-3. **Optional readiness poll**: If enabled, polls EC2/RDS with exponential backoff until ready or until `MaxPollMinutes` is reached (no infinite hang).
-4. **Tracking delay**: Sleeps for a configurable number of minutes (default 10) so billing can detect the activity.
-5. **Cleanup**: Automatically destroys all provisioned resources to prevent accidental recurring charges.
+2. **Load state**: Reads `.aws-freetier-state.json` (or your custom path) and skips completed tasks.
+3. **Provisioning**: Creates only the remaining enabled resources natively via the `aws` CLI; IDs are saved immediately.
+4. **Tracking Delay**: Sleeps for 3 minutes to ensure the AWS billing systems detect the activity.
+5. **Cleanup**: Automatically destroys provisioned resources and marks those tasks completed in the state file.
 
 ### Security & Privacy
 These scripts run locally on your machine and communicate directly with the AWS API. No private information, AWS account IDs, or region specifics are hardcoded. They dynamically fetch your caller identity and region context from your local `aws configure` session.
+
+> **Note**: Allow 24-48 hours for the promotional credits to appear in your Billing Dashboard after a successful run.
