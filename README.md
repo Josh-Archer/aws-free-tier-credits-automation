@@ -29,6 +29,27 @@ chmod +x run_and_cleanup.sh
 ./run_and_cleanup.sh
 ```
 
+### Dry-run (print AWS CLI calls only)
+Preview the exact AWS CLI invocations the scripts would run **without creating or deleting any resources**. Useful for auditing commands before a live run. No AWS credentials or network access are required in dry-run mode.
+
+**PowerShell:**
+```powershell
+.\run_and_cleanup.ps1 -DryRun
+```
+
+**Bash:**
+```bash
+./run_and_cleanup.sh --dry-run
+```
+
+Dry-run can be combined with skip flags to preview a partial run, for example:
+```powershell
+.\run_and_cleanup.ps1 -DryRun -EnableRDS $false -EnableBudget $false
+```
+```bash
+./run_and_cleanup.sh --dry-run --skip-rds --skip-budget
+```
+
 ### Customizing Tasks (Skipping Completed Credits)
 Because AWS does not provide an API to check your Promotional Credit balance programmatically, you must manually check your AWS Billing Console to see which tasks you've already completed.
 
@@ -49,102 +70,24 @@ Available Flags (PowerShell):
 - `-EnableRDS` (Default: `$true`)
 - `-EnableLambda` (Default: `$true`)
 - `-EnableBudget` (Default: `$true`)
-- `-StateFile` (optional path; see [State file](#state-file-idempotent-re-runs))
-- `-ResetState` (delete state and start clean)
-- `-Force` (re-run tasks even if marked completed)
+- `-DryRun` — print AWS CLI calls only; no create/delete side effects
+- `-AutoCheck` — explain why credits cannot be checked via API
 
 Available Flags (Bash):
 - `--skip-ec2`
 - `--skip-rds`
 - `--skip-lambda`
 - `--skip-budget`
-- `--state-file PATH`
-- `--reset-state`
-- `--force`
-
-## State file (idempotent re-runs)
-
-The scripts persist progress in a local JSON **state file** so re-runs are safe by default:
-
-- Resource IDs (EC2 instance, RDS identifier, Lambda function/role, Budget name) are written as soon as resources are created.
-- Each task is marked `completed` after successful cleanup.
-- On the next run, **completed tasks are skipped** unless you force or reset.
-- If a previous run was interrupted after provisioning, the next run **resumes cleanup** using the saved IDs instead of creating duplicates.
-
-### Default path
-
-| Platform   | Default state file path |
-|-----------|--------------------------|
-| Either    | `.aws-freetier-state.json` in the same directory as the script |
-
-Override with:
-
-```powershell
-.\run_and_cleanup.ps1 -StateFile "C:\path\to\my-state.json"
-```
-
-```bash
-./run_and_cleanup.sh --state-file /path/to/my-state.json
-```
-
-### State schema (overview)
-
-```json
-{
-  "version": 1,
-  "accountId": "123456789012",
-  "updatedAt": "2026-07-28T12:00:00Z",
-  "tasks": {
-    "ec2": { "status": "completed", "instanceId": "i-...", "completedAt": "..." },
-    "rds": { "status": "completed", "dbInstanceId": "freetier-db-...", "completedAt": "..." },
-    "lambda": { "status": "completed", "functionName": "...", "roleName": "...", "completedAt": "..." },
-    "budget": { "status": "completed", "budgetName": "...", "completedAt": "..." }
-  }
-}
-```
-
-Task `status` values: `pending` → `provisioned` → `completed`.
-
-### Resetting state
-
-To clear all recorded progress and treat every task as incomplete again:
-
-```powershell
-.\run_and_cleanup.ps1 -ResetState
-```
-
-```bash
-./run_and_cleanup.sh --reset-state
-```
-
-To re-run tasks that are already marked completed **without** deleting the file:
-
-```powershell
-.\run_and_cleanup.ps1 -Force
-```
-
-```bash
-./run_and_cleanup.sh --force
-```
-
-You can also delete the state file manually:
-
-```powershell
-Remove-Item .\.aws-freetier-state.json   # path next to the script
-```
-
-```bash
-rm .aws-freetier-state.json
-```
-
-> The state file is local and may contain AWS resource identifiers for your account. Do not commit it to version control.
+- `--dry-run` — print AWS CLI calls only; no create/delete side effects
+- `--auto-check` — explain why credits cannot be checked via API
 
 ## How it Works
 1. **Pre-flight Check**: Verifies your active `aws sts get-caller-identity` and performs dry-run permission checks.
-2. **Load state**: Reads `.aws-freetier-state.json` (or your custom path) and skips completed tasks.
-3. **Provisioning**: Creates only the remaining enabled resources natively via the `aws` CLI; IDs are saved immediately.
-4. **Tracking Delay**: Sleeps for 3 minutes to ensure the AWS billing systems detect the activity.
-5. **Cleanup**: Automatically destroys provisioned resources and marks those tasks completed in the state file.
+2. **Provisioning**: Creates the enabled resources natively via the `aws` CLI.
+3. **Tracking Delay**: Sleeps for 3 minutes to ensure the AWS billing systems detect the activity.
+4. **Cleanup**: Automatically destroys all provisioned resources to prevent accidental recurring charges.
+
+With `-DryRun` / `--dry-run`, steps 1–4 are simulated: each `aws` CLI invocation is printed with a `[DRY-RUN]` prefix, resource IDs use placeholders, the wait is skipped, and nothing is created or deleted.
 
 ### Security & Privacy
 These scripts run locally on your machine and communicate directly with the AWS API. No private information, AWS account IDs, or region specifics are hardcoded. They dynamically fetch your caller identity and region context from your local `aws configure` session.
