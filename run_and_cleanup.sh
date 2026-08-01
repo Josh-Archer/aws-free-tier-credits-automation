@@ -112,8 +112,26 @@ fi
 if [ "$ENABLE_RDS" = true ]; then
     log_info "Creating RDS Database (db.t3.micro MySQL)..."
     RDS_ID="freetier-db-$RANDOM"
-    aws rds create-db-instance --db-instance-identifier $RDS_ID --allocated-storage 20 --engine mysql --engine-version 8.0 --instance-class db.t3.micro --master-username admin --master-user-password "FreeTierPassword123!" --no-publicly-accessible --skip-final-snapshot >/dev/null
-    log_success "Created RDS Database: $RDS_ID"
+    # Prefer env override; otherwise generate a one-time secret (never logged in full).
+    # RDS forbids '/', '"', '@', and space in master passwords.
+    if [ -n "${RDS_MASTER_PASSWORD:-}" ]; then
+        MASTER_PASSWORD="$RDS_MASTER_PASSWORD"
+    else
+        MASTER_PASSWORD=$(LC_ALL=C tr -dc 'A-Za-z0-9!#$%&()*+,-.:;<=>?[]^_{|}~' </dev/urandom | head -c 32)
+    fi
+    aws rds create-db-instance \
+        --db-instance-identifier "$RDS_ID" \
+        --allocated-storage 20 \
+        --engine mysql \
+        --engine-version 8.0 \
+        --instance-class db.t3.micro \
+        --master-username admin \
+        --master-user-password "$MASTER_PASSWORD" \
+        --no-publicly-accessible \
+        --skip-final-snapshot >/dev/null
+    # Password not needed for delete-db-instance cleanup; discard immediately.
+    unset MASTER_PASSWORD
+    log_success "Created RDS Database: $RDS_ID (master password not logged)"
 fi
 
 if [ "$ENABLE_LAMBDA" = true ]; then

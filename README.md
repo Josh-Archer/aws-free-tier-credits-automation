@@ -65,4 +65,6 @@ Available Flags (Bash):
 ### Security & Privacy
 These scripts run locally on your machine and communicate directly with the AWS API. No private information, AWS account IDs, or region specifics are hardcoded. They dynamically fetch your caller identity and region context from your local `aws configure` session.
 
+RDS master passwords are never hardcoded: each run uses a randomly generated secret (or `RDS_MASTER_PASSWORD` if you set it). The password is not printed to the console, and cleanup does not require it (`delete-db-instance` uses the instance identifier only). Do not commit secrets.
+
 > **Note**: Allow 24-48 hours for the promotional credits to appear in your Billing Dashboard after a successful run.
