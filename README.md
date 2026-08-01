@@ -58,9 +58,9 @@ Available Flags (Bash):
 
 ## How it Works
 1. **Pre-flight Check**: Verifies your active `aws sts get-caller-identity` and performs dry-run permission checks.
-2. **Provisioning**: Creates the enabled resources natively via the `aws` CLI.
+2. **Provisioning**: Creates the enabled resources natively via the `aws` CLI. Each resource ID is recorded as soon as create succeeds (including partial Lambda/IAM creates).
 3. **Tracking Delay**: Sleeps for 3 minutes to ensure the AWS billing systems detect the activity.
-4. **Cleanup**: Automatically destroys all provisioned resources to prevent accidental recurring charges.
+4. **Cleanup**: Always runs via `try`/`finally` (PowerShell) or an `EXIT`/`INT`/`TERM` trap (Bash), even if provisioning fails mid-run or the process is interrupted. Successful deletes clear tracking; any leftovers are printed with IDs for manual deletion and the script exits non-zero.
 
 ### Security & Privacy
 These scripts run locally on your machine and communicate directly with the AWS API. No private information, AWS account IDs, or region specifics are hardcoded. They dynamically fetch your caller identity and region context from your local `aws configure` session.
