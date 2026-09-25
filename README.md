@@ -93,7 +93,7 @@ Because AWS does not provide an API to check your Promotional Credit balance pro
 2. **Pre-flight Check**: Verifies `aws sts get-caller-identity` and permission checks for enabled tasks.
 3. **Provisioning**: Each enabled plugin creates its minimal resources via the `aws` CLI.
 4. **Tracking Delay**: Sleeps for 3 minutes so billing systems can detect activity.
-5. **Cleanup**: Plugins destroy resources they created (reverse order).
+5. **Cleanup**: Plugins destroy resources they created (reverse order). If interrupted during the wait (Ctrl-C), runners trap the signal and clean up all provisioned resources before exiting.
 
 ### Expanding coverage when AWS changes the program
 1. Confirm new earned-credit tasks in the AWS Free Tier / Billing console.

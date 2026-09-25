@@ -243,23 +243,39 @@ foreach ($t in $allTasks) {
     }
 }
 
+function Invoke-CleanupResources {
+    Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
+
+    for ($i = $provisionedOrder.Count - 1; $i -ge 0; $i--) {
+        $id = $provisionedOrder[$i]
+        $plugin = $script:TaskPluginMap[$id]
+        try {
+            & $plugin.Cleanup $taskStates[$id]
+        } catch {
+            Write-Host "Cleanup error for task '$id': $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+}
+
 # --- WAITING ---
 Write-Host "`n=======================================================" -ForegroundColor Yellow
 Write-Host "Provisioning phase complete!"
 Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
-Start-Sleep -Seconds 180
-Write-Host "=======================================================" -ForegroundColor Yellow
 
-# --- CLEANUP ---
-Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
-
-for ($i = $provisionedOrder.Count - 1; $i -ge 0; $i--) {
-    $id = $provisionedOrder[$i]
-    $plugin = $script:TaskPluginMap[$id]
-    try {
-        & $plugin.Cleanup $taskStates[$id]
-    } catch {
-        Write-Host "Cleanup error for task '$id': $($_.Exception.Message)" -ForegroundColor Yellow
+$waitSeconds = if ($env:WAIT_SECONDS) { [int]$env:WAIT_SECONDS } else { 180 }
+$waitCompleted = $false
+try {
+    Start-Sleep -Seconds $waitSeconds
+    $waitCompleted = $true
+    Write-Host "=======================================================" -ForegroundColor Yellow
+} finally {
+    if (-not $waitCompleted) {
+        Write-Host "`nInterrupted during wait. Cleaning up provisioned resources..." -ForegroundColor Yellow
+    }
+    Invoke-CleanupResources
+    if (-not $waitCompleted) {
+        [System.Environment]::Exit(130)
+        exit 130
     }
 }
 
