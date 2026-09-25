@@ -268,26 +268,49 @@ for id in "${ALL_TASK_IDS[@]}"; do
     fi
 done
 
+# --- CLEANUP ---
+cleanup_resources() {
+    log_info "\n=== CLEANING UP RESOURCES ==="
+
+    # Cleanup in reverse order of provision
+    for ((i=${#PROVISIONED_IDS[@]}-1; i>=0; i--)); do
+        id="${PROVISIONED_IDS[$i]}"
+        cleanup_fn="task_${id}_cleanup"
+        if declare -f "$cleanup_fn" >/dev/null; then
+            "$cleanup_fn" || log_warn "Cleanup reported an error for task: $id"
+        fi
+    done
+
+    # Residual temp files from plugins
+    rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
+}
+
+SLEEP_PID=""
+
+handle_interrupt() {
+    trap - INT TERM
+    if [ -n "$SLEEP_PID" ]; then
+        kill "$SLEEP_PID" 2>/dev/null || true
+    fi
+    echo ""
+    log_warn "Interrupted during wait. Cleaning up provisioned resources..."
+    cleanup_resources
+    exit 130
+}
+
 # --- WAITING ---
 echo -e "\n======================================================="
 log_warn "Provisioning phase complete!"
 log_warn "Waiting 3 minutes for AWS to register the activity..."
-sleep 180
+trap handle_interrupt INT TERM
+sleep "${WAIT_SECONDS:-180}" &
+SLEEP_PID=$!
+wait "$SLEEP_PID" 2>/dev/null || true
+SLEEP_PID=""
+trap - INT TERM
 echo "======================================================="
 
-# --- CLEANUP ---
-log_info "\n=== CLEANING UP RESOURCES ==="
-
-# Cleanup in reverse order of provision
-for ((i=${#PROVISIONED_IDS[@]}-1; i>=0; i--)); do
-    id="${PROVISIONED_IDS[$i]}"
-    cleanup_fn="task_${id}_cleanup"
-    if declare -f "$cleanup_fn" >/dev/null; then
-        "$cleanup_fn" || log_warn "Cleanup reported an error for task: $id"
-    fi
-done
-
-# Residual temp files from plugins
-rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
+cleanup_resources
 
 log_success "\nAutomation Finished Successfully!"
+
