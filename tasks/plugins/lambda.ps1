@@ -13,9 +13,14 @@ function Invoke-TaskLambdaProvision {
     $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
     $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
     aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -ErrorAction SilentlyContinue trust-policy.json
+        throw "Failed to create IAM role: $roleName"
+    }
 
     # Wait for role to propagate
-    Start-Sleep -Seconds 10
+    $roleWait = if ($env:LAMBDA_ROLE_WAIT) { [int]$env:LAMBDA_ROLE_WAIT } else { 10 }
+    Start-Sleep -Seconds $roleWait
 
     $lambdaCode = "def lambda_handler(event, context): return 'Hello Free Tier'"
     $lambdaCode | Out-File -FilePath main.py -Encoding ascii
@@ -28,6 +33,11 @@ function Invoke-TaskLambdaProvision {
         --role "arn:aws:iam::${account}:role/$roleName" `
         --handler main.lambda_handler `
         --zip-file fileb://lambda.zip | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Failed to create Lambda function: $funcName" -ForegroundColor Red
+        Invoke-TaskLambdaCleanup -State @{ LambdaRoleName = $roleName }
+        throw "Failed to create Lambda function: $funcName"
+    }
 
     Write-Host "Created Lambda: $funcName" -ForegroundColor Green
     return @{ LambdaRoleName = $roleName; LambdaName = $funcName }
@@ -35,12 +45,18 @@ function Invoke-TaskLambdaProvision {
 
 function Invoke-TaskLambdaCleanup {
     param([hashtable]$State)
-    if ($State.LambdaName) {
+    $cleaned = $false
+    if ($State -and $State.LambdaName) {
         Write-Host "Deleting Lambda Function: $($State.LambdaName)..."
         aws lambda delete-function --function-name $State.LambdaName | Out-Null
-        if ($State.LambdaRoleName) {
-            aws iam delete-role --role-name $State.LambdaRoleName | Out-Null
-        }
+        $cleaned = $true
+    }
+    if ($State -and $State.LambdaRoleName) {
+        Write-Host "Deleting IAM Role: $($State.LambdaRoleName)..."
+        aws iam delete-role --role-name $State.LambdaRoleName | Out-Null
+        $cleaned = $true
+    }
+    if ($cleaned) {
         Write-Host "Destroyed Lambda." -ForegroundColor Green
     }
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip
