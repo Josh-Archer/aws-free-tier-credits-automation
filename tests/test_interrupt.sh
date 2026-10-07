@@ -91,6 +91,10 @@ case "\$cmd" in
                 exit 0
                 ;;
             create-function)
+                if [ -n "\${CREATE_FUNCTION_SIGNAL_FILE:-}" ]; then
+                    touch "\${CREATE_FUNCTION_SIGNAL_FILE}"
+                    sleep 5
+                fi
                 exit 0
                 ;;
             delete-function)
@@ -272,6 +276,138 @@ if proc.returncode != 130:
         exit 1
     }
     echo "PASS: PowerShell runner normal completion succeeded."
+fi
+
+# Test 5: Bash runner interrupted during Lambda create
+echo "=== Test 5: Bash runner interrupted during Lambda create ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/bash_lambda_interrupt.log"
+SIGNAL_FILE="${TEST_TMP}/lambda_create_signal_bash"
+rm -f "$SIGNAL_FILE"
+
+python3 -c "
+import subprocess, time, signal, os, sys
+
+env = os.environ.copy()
+env['CREATE_FUNCTION_SIGNAL_FILE'] = '${SIGNAL_FILE}'
+env['LAMBDA_ROLE_WAIT'] = '0'
+
+proc = subprocess.Popen(
+    ['bash', '${REPO_DIR}/run_and_cleanup.sh', '--only', 'lambda'],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    start_new_session=True,
+    cwd='${REPO_DIR}',
+    env=env
+)
+
+interrupted = False
+start_time = time.time()
+while time.time() - start_time < 10:
+    if os.path.exists('${SIGNAL_FILE}'):
+        time.sleep(0.1)
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        interrupted = True
+        break
+    time.sleep(0.05)
+
+rest_out, _ = proc.communicate(timeout=10)
+full_output = rest_out
+with open('${LOG_OUT}', 'w') as f:
+    f.write(full_output)
+
+if not interrupted:
+    print('Error: Failed to reach lambda create-function before timeout', file=sys.stderr)
+    sys.exit(1)
+
+if proc.returncode != 130:
+    print(f'Error: Expected exit code 130, got {proc.returncode}', file=sys.stderr)
+    sys.exit(1)
+"
+
+grep -q "lambda delete-function --function-name" "$AWS_LOG" || {
+    echo "FAIL: Expected lambda delete-function call in aws log"
+    cat "$AWS_LOG"
+    exit 1
+}
+grep -q "iam delete-role --role-name" "$AWS_LOG" || {
+    echo "FAIL: Expected iam delete-role call in aws log"
+    cat "$AWS_LOG"
+    exit 1
+}
+if grep -q "Automation Finished Successfully!" "$LOG_OUT"; then
+    echo "FAIL: Did not expect success message when interrupted"
+    cat "$LOG_OUT"
+    exit 1
+fi
+echo "PASS: Bash runner interrupted during Lambda create called delete-function and delete-role."
+
+# Test 6: PowerShell runner interrupted during Lambda create (if pwsh is available)
+if command -v pwsh >/dev/null 2>&1; then
+    echo "=== Test 6: PowerShell runner interrupted during Lambda create ==="
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_lambda_interrupt.log"
+    SIGNAL_FILE="${TEST_TMP}/lambda_create_signal_pwsh"
+    rm -f "$SIGNAL_FILE"
+
+    python3 -c "
+import subprocess, time, signal, os, sys
+
+env = os.environ.copy()
+env['CREATE_FUNCTION_SIGNAL_FILE'] = '${SIGNAL_FILE}'
+env['LAMBDA_ROLE_WAIT'] = '0'
+
+proc = subprocess.Popen(
+    ['pwsh', '-File', '${REPO_DIR}/run_and_cleanup.ps1', '-Only', 'lambda'],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    start_new_session=True,
+    cwd='${REPO_DIR}',
+    env=env
+)
+
+interrupted = False
+start_time = time.time()
+while time.time() - start_time < 10:
+    if os.path.exists('${SIGNAL_FILE}'):
+        time.sleep(0.1)
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        interrupted = True
+        break
+    time.sleep(0.05)
+
+rest_out, _ = proc.communicate(timeout=10)
+full_output = rest_out
+with open('${LOG_OUT}', 'w') as f:
+    f.write(full_output)
+
+if not interrupted:
+    print('Error: Failed to reach lambda create-function in pwsh before timeout', file=sys.stderr)
+    sys.exit(1)
+
+if proc.returncode != 130:
+    print(f'Error: Expected exit code 130, got {proc.returncode}', file=sys.stderr)
+    sys.exit(1)
+"
+
+    grep -q "lambda delete-function --function-name" "$AWS_LOG" || {
+        echo "FAIL: Expected lambda delete-function call in aws log for pwsh"
+        cat "$AWS_LOG"
+        exit 1
+    }
+    grep -q "iam delete-role --role-name" "$AWS_LOG" || {
+        echo "FAIL: Expected iam delete-role call in aws log for pwsh"
+        cat "$AWS_LOG"
+        exit 1
+    }
+    if grep -q "Automation Finished Successfully!" "$LOG_OUT"; then
+        echo "FAIL: Did not expect success message when interrupted in pwsh"
+        cat "$LOG_OUT"
+        exit 1
+    fi
+    echo "PASS: PowerShell runner interrupted during Lambda create called delete-function and delete-role."
 fi
 
 echo "All tests passed successfully!"
