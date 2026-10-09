@@ -46,8 +46,7 @@ function Invoke-TaskLambdaProvision {
         --zip-file fileb://lambda.zip | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create Lambda function: $funcName" -ForegroundColor Red
-        # Keep LambdaName on interrupt (130) so cleanup can delete a partial create.
-        if ($LASTEXITCODE -ne 130 -and $null -ne $script:CurrentTaskState) {
+        if ($null -ne $script:CurrentTaskState) {
             $script:CurrentTaskState.Remove("LambdaName")
         }
         try {

@@ -38,13 +38,9 @@ task_lambda_provision() {
         --role "arn:aws:iam::${ACCOUNT_ID}:role/${TASK_LAMBDA_ROLE}" \
         --handler main.lambda_handler \
         --zip-file fileb://lambda.zip >/dev/null; then
-        local ec=$?
-        # Keep name on interrupt (130) so cleanup can delete a partial create.
-        if [ "$ec" -ne 130 ]; then
-            TASK_LAMBDA_NAME=""
-        fi
+        TASK_LAMBDA_NAME=""
         log_error "Failed to create Lambda function: $func_name"
-        task_lambda_cleanup || true
+        task_lambda_cleanup
         return 1
     fi
 

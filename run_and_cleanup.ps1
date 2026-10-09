@@ -271,6 +271,23 @@ function Invoke-CleanupResources {
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip, config.txt, profiles.txt
 }
 
+$script:AwsApp = @(Get-Command -CommandType Application aws)[0].Source
+$script:InInterruptHandler = $false
+function aws {
+    & $script:AwsApp @args
+    if (-not $script:InInterruptHandler -and ($LASTEXITCODE -eq 130 -or $LASTEXITCODE -eq 143)) {
+        $script:InInterruptHandler = $true
+        if ($currentPhase -eq "wait") {
+            Write-Host "`nInterrupted during wait. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        } else {
+            Write-Host "`nInterrupted during provisioning. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        }
+        Invoke-CleanupResources
+        [System.Environment]::Exit(130)
+        exit 130
+    }
+}
+
 try {
     # --- PROVISIONING ---
     Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
