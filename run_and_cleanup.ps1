@@ -292,6 +292,16 @@ try {
             if (-not $failedProvisions.Contains($t.id)) {
                 $failedProvisions.Add($t.id) | Out-Null
             }
+            $inProgState = $script:CurrentTaskState
+            $taskStates[$t.id] = $inProgState
+            try {
+                & $plugin.Cleanup $inProgState
+            } catch {
+                Write-Host "Cleanup error for task '$($t.id)': $($_.Exception.Message)" -ForegroundColor Yellow
+                if (-not $failedCleanups.Contains($t.id)) {
+                    $failedCleanups.Add($t.id) | Out-Null
+                }
+            }
             $script:CurrentTaskId = $null
             $script:CurrentTaskState = @{}
         }

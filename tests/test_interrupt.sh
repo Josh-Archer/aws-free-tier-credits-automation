@@ -164,12 +164,12 @@ grep -q "Interrupted during wait. Cleaning up provisioned resources..." "$LOG_OU
 }
 grep -q "ec2 terminate-instances --instance-ids i-REDACTED_TEST_EC2" "$AWS_LOG" || {
     echo "FAIL: Expected ec2 terminate-instances call in aws log"
-    cat "$AWS_LOG"
+    cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
     exit 1
 }
 grep -q "budgets delete-budget" "$AWS_LOG" || {
     echo "FAIL: Expected budgets delete-budget call in aws log"
-    cat "$AWS_LOG"
+    cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
     exit 1
 }
 echo "PASS: Bash runner interrupted during wait cleaned up resources and exited 130."
@@ -247,12 +247,12 @@ if proc.returncode != 130:
     }
     grep -q "ec2 terminate-instances --instance-ids i-REDACTED_TEST_EC2" "$AWS_LOG" || {
         echo "FAIL: Expected ec2 terminate-instances call in aws log for pwsh"
-        cat "$AWS_LOG"
+        cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
         exit 1
     }
     grep -q "budgets delete-budget" "$AWS_LOG" || {
         echo "FAIL: Expected budgets delete-budget call in aws log for pwsh"
-        cat "$AWS_LOG"
+        cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
         exit 1
     }
     echo "PASS: PowerShell runner interrupted during wait cleaned up resources and exited 130."
@@ -328,12 +328,12 @@ if proc.returncode != 130:
 
 grep -q "lambda delete-function --function-name" "$AWS_LOG" || {
     echo "FAIL: Expected lambda delete-function call in aws log"
-    cat "$AWS_LOG"
+    cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
     exit 1
 }
 grep -q "iam delete-role --role-name" "$AWS_LOG" || {
     echo "FAIL: Expected iam delete-role call in aws log"
-    cat "$AWS_LOG"
+    cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
     exit 1
 }
 if grep -q "Automation Finished Successfully!" "$LOG_OUT"; then
@@ -394,12 +394,12 @@ if proc.returncode != 130:
 
     grep -q "lambda delete-function --function-name" "$AWS_LOG" || {
         echo "FAIL: Expected lambda delete-function call in aws log for pwsh"
-        cat "$AWS_LOG"
+        cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
         exit 1
     }
     grep -q "iam delete-role --role-name" "$AWS_LOG" || {
         echo "FAIL: Expected iam delete-role call in aws log for pwsh"
-        cat "$AWS_LOG"
+        cat "$AWS_LOG"; echo "=== LOG_OUT ==="; cat "$LOG_OUT"
         exit 1
     }
     if grep -q "Automation Finished Successfully!" "$LOG_OUT"; then

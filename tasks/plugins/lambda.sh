@@ -39,11 +39,12 @@ task_lambda_provision() {
         --handler main.lambda_handler \
         --zip-file fileb://lambda.zip >/dev/null; then
         local ec=$?
+        # Keep name on interrupt (130) so cleanup can delete a partial create.
         if [ "$ec" -ne 130 ]; then
             TASK_LAMBDA_NAME=""
         fi
         log_error "Failed to create Lambda function: $func_name"
-        task_lambda_cleanup
+        task_lambda_cleanup || true
         return 1
     fi
 
@@ -55,9 +56,19 @@ task_lambda_cleanup() {
     local failed=false
     if [ -n "${TASK_LAMBDA_NAME:-}" ]; then
         log_info "Deleting Lambda Function: $TASK_LAMBDA_NAME..."
-        aws lambda delete-function --function-name "$TASK_LAMBDA_NAME" >/dev/null 2>&1 || true
-        TASK_LAMBDA_NAME=""
-        cleaned=true
+        local del_err
+        if ! del_err=$(aws lambda delete-function --function-name "$TASK_LAMBDA_NAME" 2>&1); then
+            if [[ "$del_err" =~ ResourceNotFoundException ]]; then
+                TASK_LAMBDA_NAME=""
+                cleaned=true
+            else
+                log_error "Failed to delete Lambda function: $TASK_LAMBDA_NAME"
+                failed=true
+            fi
+        else
+            TASK_LAMBDA_NAME=""
+            cleaned=true
+        fi
     fi
     if [ -n "${TASK_LAMBDA_ROLE:-}" ]; then
         log_info "Deleting IAM Role: $TASK_LAMBDA_ROLE..."

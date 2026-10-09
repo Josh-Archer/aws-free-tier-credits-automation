@@ -327,6 +327,13 @@ for id in "${ALL_TASK_IDS[@]}"; do
             else
                 log_error "Provisioning failed for task: $id"
                 FAILED_PROVISIONS+=("$id")
+                cleanup_fn="task_${id}_cleanup"
+                if declare -f "$cleanup_fn" >/dev/null; then
+                    if ! "$cleanup_fn"; then
+                        log_warn "Cleanup reported an error for task: $id"
+                        add_failed_cleanup "$id"
+                    fi
+                fi
             fi
             CURRENT_TASK=""
         else
@@ -379,8 +386,11 @@ if [ ${#FAILED_PROVISIONS[@]} -gt 0 ] || [ ${#FAILED_CLEANUPS[@]} -gt 0 ]; then
                     ;;
                 lambda)
                     res=""
-                    [ -n "${TASK_LAMBDA_NAME:-}" ] && res+="Function: $TASK_LAMBDA_NAME "
-                    [ -n "${TASK_LAMBDA_ROLE:-}" ] && res+="Role: $TASK_LAMBDA_ROLE"
+                    [ -n "${TASK_LAMBDA_NAME:-}" ] && res+="Function: $TASK_LAMBDA_NAME"
+                    if [ -n "${TASK_LAMBDA_ROLE:-}" ]; then
+                        [ -n "$res" ] && res+=" "
+                        res+="Role: $TASK_LAMBDA_ROLE"
+                    fi
                     if [ -n "$res" ]; then
                         log_error "  - Lambda ($res)"
                     else

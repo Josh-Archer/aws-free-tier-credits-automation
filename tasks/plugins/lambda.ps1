@@ -46,10 +46,14 @@ function Invoke-TaskLambdaProvision {
         --zip-file fileb://lambda.zip | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create Lambda function: $funcName" -ForegroundColor Red
+        # Keep LambdaName on interrupt (130) so cleanup can delete a partial create.
         if ($LASTEXITCODE -ne 130 -and $null -ne $script:CurrentTaskState) {
             $script:CurrentTaskState.Remove("LambdaName")
         }
-        Invoke-TaskLambdaCleanup -State $script:CurrentTaskState
+        try {
+            Invoke-TaskLambdaCleanup -State $script:CurrentTaskState
+        } catch {
+        }
         throw "Failed to create Lambda function: $funcName"
     }
 
@@ -61,11 +65,26 @@ function Invoke-TaskLambdaCleanup {
     param([hashtable]$State)
     $cleaned = $false
     $failed = $false
+    $errors = New-Object System.Collections.Generic.List[string]
+
     if ($State -and $State.LambdaName) {
         Write-Host "Deleting Lambda Function: $($State.LambdaName)..."
-        # Deleting a non-existent function must be tolerated in cleanup
-        aws lambda delete-function --function-name $State.LambdaName 2>$null | Out-Null
-        $cleaned = $true
+        $delOut = aws lambda delete-function --function-name $State.LambdaName 2>&1
+        $ec = $LASTEXITCODE
+        if ($ec -ne 0) {
+            $delStr = ($delOut | Out-String)
+            if ($delStr -match "ResourceNotFoundException") {
+                $State.Remove("LambdaName")
+                $cleaned = $true
+            } else {
+                Write-Host "Failed to delete Lambda function: $($State.LambdaName)" -ForegroundColor Red
+                $failed = $true
+                $errors.Add("Failed to delete Lambda function: $($State.LambdaName)") | Out-Null
+            }
+        } else {
+            $State.Remove("LambdaName")
+            $cleaned = $true
+        }
     }
     if ($State -and $State.LambdaRoleName) {
         Write-Host "Deleting IAM Role: $($State.LambdaRoleName)..."
@@ -73,13 +92,16 @@ function Invoke-TaskLambdaCleanup {
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Failed to delete IAM role: $($State.LambdaRoleName)" -ForegroundColor Red
             $failed = $true
+            $errors.Add("Failed to delete IAM role: $($State.LambdaRoleName)") | Out-Null
         } else {
+            $State.Remove("LambdaRoleName")
             $cleaned = $true
         }
     }
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip
     if ($failed) {
-        throw "Failed to delete IAM role: $($State.LambdaRoleName)"
+        $msg = if ($errors.Count -gt 0) { $errors -join "; " } else { "Failed to clean up Lambda resources" }
+        throw $msg
     }
     if ($cleaned) {
         Write-Host "Destroyed Lambda." -ForegroundColor Green
