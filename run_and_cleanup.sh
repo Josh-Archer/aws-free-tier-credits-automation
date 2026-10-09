@@ -249,35 +249,46 @@ done
 log_info "\nStarting AWS Free Tier Credit Automation..."
 echo "Enabled Tasks: $ENABLED_LIST"
 
-# --- PROVISIONING ---
-log_info "\n=== PROVISIONING RESOURCES ==="
+# --- PROVISIONING & CLEANUP STATE ---
 PROVISIONED_IDS=()
+FAILED_PROVISIONS=()
+FAILED_CLEANUPS=()
+CURRENT_TASK=""
+RUNNER_PHASE="provisioning"
+SLEEP_PID=""
 
-for id in "${ALL_TASK_IDS[@]}"; do
-    if [ "${ENABLE[$id]}" = true ]; then
-        provision_fn="task_${id}_provision"
-        if declare -f "$provision_fn" >/dev/null; then
-            if "$provision_fn"; then
-                PROVISIONED_IDS+=("$id")
-            else
-                log_error "Provisioning failed for task: $id"
-            fi
-        else
-            log_error "Plugin missing provision function: $provision_fn"
-        fi
-    fi
-done
+add_failed_cleanup() {
+    local task_id=$1
+    for f in "${FAILED_CLEANUPS[@]:-}"; do
+        [ "$f" = "$task_id" ] && return 0
+    done
+    FAILED_CLEANUPS+=("$task_id")
+}
 
-# --- CLEANUP ---
 cleanup_resources() {
     log_info "\n=== CLEANING UP RESOURCES ==="
 
+    if [ -n "${CURRENT_TASK:-}" ]; then
+        local in_prog="$CURRENT_TASK"
+        CURRENT_TASK=""
+        local cleanup_fn="task_${in_prog}_cleanup"
+        if declare -f "$cleanup_fn" >/dev/null; then
+            if ! "$cleanup_fn"; then
+                log_warn "Cleanup reported an error for task: $in_prog"
+                add_failed_cleanup "$in_prog"
+            fi
+        fi
+    fi
+
     # Cleanup in reverse order of provision
     for ((i=${#PROVISIONED_IDS[@]}-1; i>=0; i--)); do
-        id="${PROVISIONED_IDS[$i]}"
-        cleanup_fn="task_${id}_cleanup"
+        local id="${PROVISIONED_IDS[$i]}"
+        local cleanup_fn="task_${id}_cleanup"
         if declare -f "$cleanup_fn" >/dev/null; then
-            "$cleanup_fn" || log_warn "Cleanup reported an error for task: $id"
+            if ! "$cleanup_fn"; then
+                log_warn "Cleanup reported an error for task: $id"
+                add_failed_cleanup "$id"
+            fi
         fi
     done
 
@@ -285,32 +296,122 @@ cleanup_resources() {
     rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
 }
 
-SLEEP_PID=""
-
 handle_interrupt() {
     trap - INT TERM
     if [ -n "$SLEEP_PID" ]; then
         kill "$SLEEP_PID" 2>/dev/null || true
     fi
     echo ""
-    log_warn "Interrupted during wait. Cleaning up provisioned resources..."
+    if [ "$RUNNER_PHASE" = "wait" ]; then
+        log_warn "Interrupted during wait. Cleaning up provisioned resources..."
+    else
+        log_warn "Interrupted during provisioning. Cleaning up provisioned resources..."
+    fi
     cleanup_resources
     exit 130
 }
 
+# Arm interrupt handler during provisioning phase
+trap handle_interrupt INT TERM
+
+# --- PROVISIONING ---
+log_info "\n=== PROVISIONING RESOURCES ==="
+
+for id in "${ALL_TASK_IDS[@]}"; do
+    if [ "${ENABLE[$id]}" = true ]; then
+        provision_fn="task_${id}_provision"
+        if declare -f "$provision_fn" >/dev/null; then
+            CURRENT_TASK="$id"
+            if "$provision_fn"; then
+                PROVISIONED_IDS+=("$id")
+            else
+                log_error "Provisioning failed for task: $id"
+                FAILED_PROVISIONS+=("$id")
+                cleanup_fn="task_${id}_cleanup"
+                if declare -f "$cleanup_fn" >/dev/null; then
+                    if ! "$cleanup_fn"; then
+                        log_warn "Cleanup reported an error for task: $id"
+                        add_failed_cleanup "$id"
+                    fi
+                fi
+            fi
+            CURRENT_TASK=""
+        else
+            log_error "Plugin missing provision function: $provision_fn"
+            FAILED_PROVISIONS+=("$id")
+        fi
+    fi
+done
+
 # --- WAITING ---
+RUNNER_PHASE="wait"
 echo -e "\n======================================================="
 log_warn "Provisioning phase complete!"
 log_warn "Waiting 3 minutes for AWS to register the activity..."
-trap handle_interrupt INT TERM
 sleep "${WAIT_SECONDS:-180}" &
 SLEEP_PID=$!
 wait "$SLEEP_PID" 2>/dev/null || true
 SLEEP_PID=""
-trap - INT TERM
 echo "======================================================="
 
+# --- CLEANUP ---
+RUNNER_PHASE="cleanup"
 cleanup_resources
+
+trap - INT TERM
+
+if [ ${#FAILED_PROVISIONS[@]} -gt 0 ] || [ ${#FAILED_CLEANUPS[@]} -gt 0 ]; then
+    log_error "\n=== AUTOMATION SUMMARY: FAILURE ==="
+    if [ ${#FAILED_PROVISIONS[@]} -gt 0 ]; then
+        log_error "Provisioning failed for task(s): ${FAILED_PROVISIONS[*]}"
+    fi
+    if [ ${#FAILED_CLEANUPS[@]} -gt 0 ]; then
+        log_error "Cleanup failed for task(s) (resources may still exist): ${FAILED_CLEANUPS[*]}"
+        log_error "The following resources may still exist in your account:"
+        for id in "${FAILED_CLEANUPS[@]}"; do
+            case "$id" in
+                ec2)
+                    if [ -n "${TASK_EC2_INSTANCE_ID:-}" ]; then
+                        log_error "  - EC2 Instance: $TASK_EC2_INSTANCE_ID"
+                    else
+                        log_error "  - EC2 resources for task: $id"
+                    fi
+                    ;;
+                rds)
+                    if [ -n "${TASK_RDS_ID:-}" ]; then
+                        log_error "  - RDS Instance: $TASK_RDS_ID"
+                    else
+                        log_error "  - RDS resources for task: $id"
+                    fi
+                    ;;
+                lambda)
+                    res=""
+                    [ -n "${TASK_LAMBDA_NAME:-}" ] && res+="Function: $TASK_LAMBDA_NAME"
+                    if [ -n "${TASK_LAMBDA_ROLE:-}" ]; then
+                        [ -n "$res" ] && res+=" "
+                        res+="Role: $TASK_LAMBDA_ROLE"
+                    fi
+                    if [ -n "$res" ]; then
+                        log_error "  - Lambda ($res)"
+                    else
+                        log_error "  - Lambda resources for task: $id"
+                    fi
+                    ;;
+                budget)
+                    if [ -n "${TASK_BUDGET_NAME:-}" ]; then
+                        log_error "  - Budget: $TASK_BUDGET_NAME"
+                    else
+                        log_error "  - Budget resources for task: $id"
+                    fi
+                    ;;
+                *)
+                    log_error "  - Task: $id"
+                    ;;
+            esac
+        done
+    fi
+    exit 1
+fi
 
 log_success "\nAutomation Finished Successfully!"
 

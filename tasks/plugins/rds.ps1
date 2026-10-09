@@ -7,6 +7,9 @@ function Invoke-TaskRdsCheck {
 function Invoke-TaskRdsProvision {
     Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
     $dbName = "freetier-db-$(Get-Random)"
+    if ($null -ne $script:CurrentTaskState) {
+        $script:CurrentTaskState["RDSId"] = $dbName
+    }
     aws rds create-db-instance `
         --db-instance-identifier $dbName `
         --allocated-storage 20 `
@@ -17,15 +20,26 @@ function Invoke-TaskRdsProvision {
         --master-user-password "FreeTierPassword123!" `
         --no-publicly-accessible `
         --skip-final-snapshot | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Failed to create RDS Database: $dbName" -ForegroundColor Red
+        if ($null -ne $script:CurrentTaskState) {
+            $script:CurrentTaskState.Remove("RDSId")
+        }
+        throw "Failed to create RDS Database: $dbName"
+    }
     Write-Host "Created RDS Database: $dbName" -ForegroundColor Green
     return @{ RDSId = $dbName }
 }
 
 function Invoke-TaskRdsCleanup {
     param([hashtable]$State)
-    if ($State.RDSId) {
+    if ($State -and $State.RDSId) {
         Write-Host "Deleting RDS Database: $($State.RDSId)..."
         aws rds delete-db-instance --db-instance-identifier $State.RDSId --skip-final-snapshot | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to delete RDS database: $($State.RDSId)" -ForegroundColor Red
+            throw "Failed to delete RDS database: $($State.RDSId)"
+        }
         Write-Host "Destroyed RDS." -ForegroundColor Green
     }
 }

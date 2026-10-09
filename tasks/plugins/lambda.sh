@@ -31,38 +31,56 @@ task_lambda_provision() {
         return 1
     fi
 
+    TASK_LAMBDA_NAME="$func_name"
     if ! aws lambda create-function \
         --function-name "$func_name" \
         --runtime python3.12 \
         --role "arn:aws:iam::${ACCOUNT_ID}:role/${TASK_LAMBDA_ROLE}" \
         --handler main.lambda_handler \
         --zip-file fileb://lambda.zip >/dev/null; then
-        log_error "Failed to create Lambda function: $func_name"
         TASK_LAMBDA_NAME=""
+        log_error "Failed to create Lambda function: $func_name"
         task_lambda_cleanup
         return 1
     fi
 
-    TASK_LAMBDA_NAME="$func_name"
     log_success "Created Lambda: $TASK_LAMBDA_NAME"
 }
 
 task_lambda_cleanup() {
     local cleaned=false
+    local failed=false
     if [ -n "${TASK_LAMBDA_NAME:-}" ]; then
         log_info "Deleting Lambda Function: $TASK_LAMBDA_NAME..."
-        aws lambda delete-function --function-name "$TASK_LAMBDA_NAME" >/dev/null 2>&1 || true
-        TASK_LAMBDA_NAME=""
-        cleaned=true
+        local del_err
+        if ! del_err=$(aws lambda delete-function --function-name "$TASK_LAMBDA_NAME" 2>&1); then
+            if [[ "$del_err" =~ ResourceNotFoundException ]]; then
+                TASK_LAMBDA_NAME=""
+                cleaned=true
+            else
+                log_error "Failed to delete Lambda function: $TASK_LAMBDA_NAME"
+                failed=true
+            fi
+        else
+            TASK_LAMBDA_NAME=""
+            cleaned=true
+        fi
     fi
     if [ -n "${TASK_LAMBDA_ROLE:-}" ]; then
         log_info "Deleting IAM Role: $TASK_LAMBDA_ROLE..."
-        aws iam delete-role --role-name "$TASK_LAMBDA_ROLE" >/dev/null 2>&1 || true
-        TASK_LAMBDA_ROLE=""
-        cleaned=true
+        if ! aws iam delete-role --role-name "$TASK_LAMBDA_ROLE" >/dev/null 2>&1; then
+            log_error "Failed to delete IAM role: $TASK_LAMBDA_ROLE"
+            failed=true
+        else
+            TASK_LAMBDA_ROLE=""
+            cleaned=true
+        fi
+    fi
+    rm -f trust-policy.json main.py lambda.zip
+    if [ "$failed" = true ]; then
+        return 1
     fi
     if [ "$cleaned" = true ]; then
         log_success "Destroyed Lambda."
     fi
-    rm -f trust-policy.json main.py lambda.zip
 }

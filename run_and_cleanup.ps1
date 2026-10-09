@@ -226,25 +226,33 @@ Write-Host "Enabled Tasks: $enabledSummary"
 
 $taskStates = @{}   # id -> state hashtable from provision
 $provisionedOrder = New-Object System.Collections.Generic.List[string]
-
-# --- PROVISIONING ---
-Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
-
-foreach ($t in $allTasks) {
-    if (-not $enabled[$t.id]) { continue }
-    $plugin = $script:TaskPluginMap[$t.id]
-    try {
-        $state = & $plugin.Provision
-        if ($null -eq $state) { $state = @{} }
-        $taskStates[$t.id] = $state
-        $provisionedOrder.Add($t.id) | Out-Null
-    } catch {
-        Write-Host "Failed to provision task '$($t.id)': $($_.Exception.Message)" -ForegroundColor Red
-    }
-}
+$failedProvisions = New-Object System.Collections.Generic.List[string]
+$failedCleanups = New-Object System.Collections.Generic.List[string]
+$script:CurrentTaskId = $null
+$script:CurrentTaskState = @{}
+$currentPhase = "provisioning"
+$executionCompleted = $false
 
 function Invoke-CleanupResources {
     Write-Host "`n=== CLEANING UP RESOURCES ===" -ForegroundColor Cyan
+
+    if ($script:CurrentTaskId) {
+        $inProgId = $script:CurrentTaskId
+        $inProgState = $script:CurrentTaskState
+        $script:CurrentTaskId = $null
+        $script:CurrentTaskState = @{}
+        $plugin = $script:TaskPluginMap[$inProgId]
+        if ($plugin) {
+            try {
+                & $plugin.Cleanup $inProgState
+            } catch {
+                Write-Host "Cleanup error for task '$inProgId': $($_.Exception.Message)" -ForegroundColor Yellow
+                if (-not $failedCleanups.Contains($inProgId)) {
+                    $failedCleanups.Add($inProgId) | Out-Null
+                }
+            }
+        }
+    }
 
     for ($i = $provisionedOrder.Count - 1; $i -ge 0; $i--) {
         $id = $provisionedOrder[$i]
@@ -253,30 +261,116 @@ function Invoke-CleanupResources {
             & $plugin.Cleanup $taskStates[$id]
         } catch {
             Write-Host "Cleanup error for task '$id': $($_.Exception.Message)" -ForegroundColor Yellow
+            if (-not $failedCleanups.Contains($id)) {
+                $failedCleanups.Add($id) | Out-Null
+            }
         }
     }
+
+    # Residual temp files from plugins
+    Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip, config.txt, profiles.txt
 }
 
-# --- WAITING ---
-Write-Host "`n=======================================================" -ForegroundColor Yellow
-Write-Host "Provisioning phase complete!"
-Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
-
-$waitSeconds = if ($env:WAIT_SECONDS) { [int]$env:WAIT_SECONDS } else { 180 }
-$waitCompleted = $false
-try {
-    Start-Sleep -Seconds $waitSeconds
-    $waitCompleted = $true
-    Write-Host "=======================================================" -ForegroundColor Yellow
-} finally {
-    if (-not $waitCompleted) {
-        Write-Host "`nInterrupted during wait. Cleaning up provisioned resources..." -ForegroundColor Yellow
-    }
-    Invoke-CleanupResources
-    if (-not $waitCompleted) {
+$script:AwsApp = @(Get-Command -CommandType Application aws)[0].Source
+$script:InInterruptHandler = $false
+function aws {
+    & $script:AwsApp @args
+    if (-not $script:InInterruptHandler -and ($LASTEXITCODE -eq 130 -or $LASTEXITCODE -eq 143)) {
+        $script:InInterruptHandler = $true
+        if ($currentPhase -eq "wait") {
+            Write-Host "`nInterrupted during wait. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        } else {
+            Write-Host "`nInterrupted during provisioning. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        }
+        Invoke-CleanupResources
         [System.Environment]::Exit(130)
         exit 130
     }
+}
+
+try {
+    # --- PROVISIONING ---
+    Write-Host "`n=== PROVISIONING RESOURCES ===" -ForegroundColor Cyan
+
+    foreach ($t in $allTasks) {
+        if (-not $enabled[$t.id]) { continue }
+        $plugin = $script:TaskPluginMap[$t.id]
+        $script:CurrentTaskId = $t.id
+        $script:CurrentTaskState = @{}
+        try {
+            $state = & $plugin.Provision
+            if ($null -eq $state) { $state = @{} }
+            $taskStates[$t.id] = $state
+            $provisionedOrder.Add($t.id) | Out-Null
+            $script:CurrentTaskId = $null
+            $script:CurrentTaskState = @{}
+        } catch {
+            Write-Host "Failed to provision task '$($t.id)': $($_.Exception.Message)" -ForegroundColor Red
+            if (-not $failedProvisions.Contains($t.id)) {
+                $failedProvisions.Add($t.id) | Out-Null
+            }
+            $inProgState = $script:CurrentTaskState
+            $taskStates[$t.id] = $inProgState
+            try {
+                & $plugin.Cleanup $inProgState
+            } catch {
+                Write-Host "Cleanup error for task '$($t.id)': $($_.Exception.Message)" -ForegroundColor Yellow
+                if (-not $failedCleanups.Contains($t.id)) {
+                    $failedCleanups.Add($t.id) | Out-Null
+                }
+            }
+            $script:CurrentTaskId = $null
+            $script:CurrentTaskState = @{}
+        }
+    }
+
+    # --- WAITING ---
+    $currentPhase = "wait"
+    Write-Host "`n=======================================================" -ForegroundColor Yellow
+    Write-Host "Provisioning phase complete!"
+    Write-Host "Waiting 3 minutes for AWS to register the activity..." -ForegroundColor Yellow
+
+    $waitSeconds = if ($env:WAIT_SECONDS) { [int]$env:WAIT_SECONDS } else { 180 }
+    Start-Sleep -Seconds $waitSeconds
+    Write-Host "=======================================================" -ForegroundColor Yellow
+
+    # --- CLEANUP ---
+    $currentPhase = "cleanup"
+    Invoke-CleanupResources
+
+    $executionCompleted = $true
+} finally {
+    if (-not $executionCompleted) {
+        if ($currentPhase -eq "wait") {
+            Write-Host "`nInterrupted during wait. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        } else {
+            Write-Host "`nInterrupted during provisioning. Cleaning up provisioned resources..." -ForegroundColor Yellow
+        }
+        Invoke-CleanupResources
+        [System.Environment]::Exit(130)
+        exit 130
+    }
+}
+
+if ($failedProvisions.Count -gt 0 -or $failedCleanups.Count -gt 0) {
+    Write-Host "`n=== AUTOMATION SUMMARY: FAILURE ===" -ForegroundColor Red
+    if ($failedProvisions.Count -gt 0) {
+        Write-Host "Provisioning failed for: $($failedProvisions -join ', ')" -ForegroundColor Red
+    }
+    if ($failedCleanups.Count -gt 0) {
+        Write-Host "Cleanup failed for: $($failedCleanups -join ', ')" -ForegroundColor Red
+        Write-Host "The following resources may still exist in your account:" -ForegroundColor Red
+        foreach ($id in $failedCleanups) {
+            $state = $taskStates[$id]
+            if ($state -and $state.Count -gt 0) {
+                $details = ($state.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ", "
+                Write-Host "  - Task $id ($details)" -ForegroundColor Red
+            } else {
+                Write-Host "  - Task $id" -ForegroundColor Red
+            }
+        }
+    }
+    exit 1
 }
 
 Write-Host "`nAutomation Finished Successfully!" -ForegroundColor Green
