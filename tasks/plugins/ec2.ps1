@@ -16,7 +16,9 @@ function Invoke-TaskEc2Provision {
     }
 
     Write-Host "Launching EC2 instance (t2.micro) with AMI $ami..."
+    $instName = "freetier-ec2-$(Get-Random)"
     $instOutput = aws ec2 run-instances --image-id $ami --instance-type t2.micro `
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$instName}]" `
         --query "Instances[0].InstanceId" --output text
     $instanceId = ($instOutput -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($instanceId) -or $instanceId.ToLower() -eq "none") {
@@ -26,10 +28,11 @@ function Invoke-TaskEc2Provision {
 
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["InstanceId"] = $instanceId
+        $script:CurrentTaskState["InstanceName"] = $instName
     }
 
     Write-Host "Created EC2 Instance: $instanceId" -ForegroundColor Green
-    return @{ InstanceId = $instanceId }
+    return @{ InstanceId = $instanceId; InstanceName = $instName }
 }
 
 function Invoke-TaskEc2Cleanup {

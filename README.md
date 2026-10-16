@@ -85,6 +85,7 @@ Because AWS does not provide an API to check your Promotional Credit balance pro
 | `-EnableEC2 / -EnableRDS / -EnableLambda / -EnableBudget` | `--skip-<id>` | Legacy per-task enable (PS) or skip (bash) |
 | `-Skip id1,id2` | `--skip-id` (repeatable) | Skip listed catalog ids |
 | `-Only id1,id2` | `--only id1,id2` | Run only these ids |
+| `-Sweep` | `--sweep` | Sweep and destroy leftover freetier resources |
 | `-ListTasks` | `--list-tasks` | Print catalog and exit |
 | `-AutoCheck` | `--auto-check` | Explain credit API limitation |
 
@@ -93,7 +94,7 @@ Because AWS does not provide an API to check your Promotional Credit balance pro
 2. **Pre-flight Check**: Verifies `aws sts get-caller-identity` and permission checks for enabled tasks.
 3. **Provisioning**: Each enabled plugin creates its minimal resources via the `aws` CLI.
 4. **Tracking Delay**: Sleeps for 3 minutes so billing systems can detect activity.
-5. **Cleanup**: Plugins destroy resources they created (reverse order). If interrupted during the wait (Ctrl-C), runners trap the signal and clean up all provisioned resources before exiting.
+5. **Cleanup**: Plugins destroy resources they created (reverse order) and sweep any leftover resources prefixed `freetier-`. Runners install an EXIT trap (Bash) and `finally` block (PowerShell) so abnormal exits, failures, or interruptions (Ctrl-C) during provisioning or the wait cannot skip cleanup.
 
 ### Expanding coverage when AWS changes the program
 1. Confirm new earned-credit tasks in the AWS Free Tier / Billing console.

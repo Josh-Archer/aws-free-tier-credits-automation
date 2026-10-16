@@ -73,7 +73,7 @@ for id in "${ALL_TASK_IDS[@]}"; do
     fi
 done
 
-ONLY_SET=false
+DO_SWEEP=false
 AUTO_CHECK=false
 LIST_TASKS=false
 
@@ -88,6 +88,7 @@ usage() {
         printf "  --skip-%-8s Skip task: %s\n" "$id" "$id"
     done
     echo "  --only IDS      Comma-separated task ids to run exclusively (e.g. ec2,lambda)"
+    echo "  --sweep         Sweep and destroy leftover freetier resources and exit"
     echo "  --list-tasks    List catalog tasks (id, credit, description) and exit"
     echo "  --auto-check    Display info about AWS credit checking limitations"
     echo "  --help          Display this help message"
@@ -105,9 +106,8 @@ list_tasks() {
     printf "%-12s %-8s %-10s %s\n" "ID" "DEFAULT" "CREDIT" "DESCRIPTION"
     printf "%-12s %-8s %-10s %s\n" "------------" "--------" "----------" "-----------"
     for id in "${ALL_TASK_IDS[@]}"; do
-        local meta name credit desc def
+        local meta credit desc def
         meta=$(task_meta "$id")
-        name=$(echo "$meta" | cut -f1)
         credit=$(echo "$meta" | cut -f2)
         desc=$(echo "$meta" | cut -f3)
         def=$(task_default_enabled "$id")
@@ -123,13 +123,13 @@ while [[ $# -gt 0 ]]; do
         --help) usage ;;
         --auto-check) AUTO_CHECK=true ;;
         --list-tasks) LIST_TASKS=true ;;
+        --sweep) DO_SWEEP=true ;;
         --only)
             shift
             if [[ $# -eq 0 ]]; then
                 log_error "--only requires a comma-separated list of task ids"
                 exit 1
             fi
-            ONLY_SET=true
             for id in "${ALL_TASK_IDS[@]}"; do ENABLE[$id]=false; done
             IFS=',' read -ra ONLY_IDS <<< "$1"
             for oid in "${ONLY_IDS[@]}"; do
@@ -143,7 +143,6 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --only=*)
-            ONLY_SET=true
             for id in "${ALL_TASK_IDS[@]}"; do ENABLE[$id]=false; done
             IFS=',' read -ra ONLY_IDS <<< "${1#*=}"
             for oid in "${ONLY_IDS[@]}"; do
@@ -256,6 +255,7 @@ FAILED_CLEANUPS=()
 CURRENT_TASK=""
 RUNNER_PHASE="provisioning"
 SLEEP_PID=""
+CLEANUP_PERFORMED=false
 
 add_failed_cleanup() {
     local task_id=$1
@@ -265,7 +265,201 @@ add_failed_cleanup() {
     FAILED_CLEANUPS+=("$task_id")
 }
 
+sweep_leftovers() {
+    log_info "Sweeping leftover freetier resources..."
+
+    # 1. EC2 Instances
+    local raw_ec2
+    if raw_ec2=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=freetier-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+        --output json 2>/dev/null); then
+        local ec2_ids=()
+        if command -v jq >/dev/null 2>&1; then
+            mapfile -t ec2_ids < <(echo "$raw_ec2" | jq -r '.Reservations[]?.Instances[]? | select(.Tags[]? | select((.Key // "") == "Name" and ((.Value // "") | startswith("freetier-")))) | .InstanceId // empty' 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+            mapfile -t ec2_ids < <(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    for r in d.get('Reservations', []):
+        for inst in r.get('Instances', []):
+            tags = {t.get('Key'): t.get('Value', '') for t in inst.get('Tags', [])}
+            name = tags.get('Name', '')
+            if name.startswith('freetier-'):
+                iid = inst.get('InstanceId')
+                if iid: print(iid)
+except Exception:
+    pass
+" "$raw_ec2" 2>/dev/null)
+        fi
+        for iid in "${ec2_ids[@]}"; do
+            [ -z "$iid" ] && continue
+            log_info "Sweeping leftover EC2 Instance: $iid..."
+            if ! aws ec2 terminate-instances --instance-ids "$iid" >/dev/null 2>&1; then
+                log_warn "Failed to terminate leftover EC2 instance: $iid"
+                add_failed_cleanup "ec2"
+            else
+                if [ "${TASK_EC2_INSTANCE_ID:-}" = "$iid" ]; then
+                    TASK_EC2_INSTANCE_ID=""
+                fi
+                log_success "Terminated leftover EC2 Instance: $iid"
+            fi
+        done
+    fi
+
+    # 2. RDS Databases
+    local raw_rds
+    if raw_rds=$(aws rds describe-db-instances --output json 2>/dev/null); then
+        local rds_ids=()
+        if command -v jq >/dev/null 2>&1; then
+            mapfile -t rds_ids < <(echo "$raw_rds" | jq -r '.DBInstances[]? | select((.DBInstanceIdentifier // "") | startswith("freetier-")) | select((.DBInstanceStatus // "") != "deleting") | .DBInstanceIdentifier' 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+            mapfile -t rds_ids < <(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    for db in d.get('DBInstances', []):
+        did = db.get('DBInstanceIdentifier', '')
+        st = db.get('DBInstanceStatus', '')
+        if did.startswith('freetier-') and st != 'deleting':
+            print(did)
+except Exception:
+    pass
+" "$raw_rds" 2>/dev/null)
+        fi
+        for did in "${rds_ids[@]}"; do
+            [ -z "$did" ] && continue
+            log_info "Sweeping leftover RDS Database: $did..."
+            if ! aws rds delete-db-instance --db-instance-identifier "$did" --skip-final-snapshot >/dev/null 2>&1; then
+                log_warn "Failed to delete leftover RDS database: $did"
+                add_failed_cleanup "rds"
+            else
+                if [ "${TASK_RDS_ID:-}" = "$did" ]; then
+                    TASK_RDS_ID=""
+                fi
+                log_success "Destroyed leftover RDS Database: $did"
+            fi
+        done
+    fi
+
+    # 3. Lambda Functions
+    local raw_lambda
+    if raw_lambda=$(aws lambda list-functions --output json 2>/dev/null); then
+        local lambda_fns=()
+        if command -v jq >/dev/null 2>&1; then
+            mapfile -t lambda_fns < <(echo "$raw_lambda" | jq -r '.Functions[]? | select((.FunctionName // "") | startswith("freetier-")) | .FunctionName' 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+            mapfile -t lambda_fns < <(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    for fn in d.get('Functions', []):
+        name = fn.get('FunctionName', '')
+        if name.startswith('freetier-'):
+            print(name)
+except Exception:
+    pass
+" "$raw_lambda" 2>/dev/null)
+        fi
+        for fn in "${lambda_fns[@]}"; do
+            [ -z "$fn" ] && continue
+            log_info "Sweeping leftover Lambda Function: $fn..."
+            local del_err
+            if ! del_err=$(aws lambda delete-function --function-name "$fn" 2>&1); then
+                if [[ ! "$del_err" =~ ResourceNotFoundException ]]; then
+                    log_warn "Failed to delete leftover Lambda function: $fn"
+                    add_failed_cleanup "lambda"
+                else
+                    if [ "${TASK_LAMBDA_NAME:-}" = "$fn" ]; then
+                        TASK_LAMBDA_NAME=""
+                    fi
+                fi
+            else
+                if [ "${TASK_LAMBDA_NAME:-}" = "$fn" ]; then
+                    TASK_LAMBDA_NAME=""
+                fi
+                log_success "Destroyed leftover Lambda Function: $fn"
+            fi
+        done
+    fi
+
+    # 4. IAM Roles
+    local raw_iam
+    if raw_iam=$(aws iam list-roles --output json 2>/dev/null); then
+        local iam_roles=()
+        if command -v jq >/dev/null 2>&1; then
+            mapfile -t iam_roles < <(echo "$raw_iam" | jq -r '.Roles[]? | select((.RoleName // "") | startswith("freetier-")) | .RoleName' 2>/dev/null)
+        elif command -v python3 >/dev/null 2>&1; then
+            mapfile -t iam_roles < <(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    for role in d.get('Roles', []):
+        rname = role.get('RoleName', '')
+        if rname.startswith('freetier-'):
+            print(rname)
+except Exception:
+    pass
+" "$raw_iam" 2>/dev/null)
+        fi
+        for rname in "${iam_roles[@]}"; do
+            [ -z "$rname" ] && continue
+            log_info "Sweeping leftover IAM Role: $rname..."
+            if ! aws iam delete-role --role-name "$rname" >/dev/null 2>&1; then
+                log_warn "Failed to delete leftover IAM role: $rname"
+                add_failed_cleanup "lambda"
+            else
+                if [ "${TASK_LAMBDA_ROLE:-}" = "$rname" ]; then
+                    TASK_LAMBDA_ROLE=""
+                fi
+                log_success "Destroyed leftover IAM Role: $rname"
+            fi
+        done
+    fi
+
+    # 5. Budgets
+    if [ -n "${ACCOUNT_ID:-}" ]; then
+        local raw_budgets
+        if raw_budgets=$(aws budgets describe-budgets --account-id "$ACCOUNT_ID" --output json 2>/dev/null); then
+            local budget_names=()
+            if command -v jq >/dev/null 2>&1; then
+                mapfile -t budget_names < <(echo "$raw_budgets" | jq -r '.Budgets[]? | select((.BudgetName // "") | startswith("freetier-")) | .BudgetName' 2>/dev/null)
+            elif command -v python3 >/dev/null 2>&1; then
+                mapfile -t budget_names < <(python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.argv[1])
+    for b in d.get('Budgets', []):
+        bname = b.get('BudgetName', '')
+        if bname.startswith('freetier-'):
+            print(bname)
+except Exception:
+    pass
+" "$raw_budgets" 2>/dev/null)
+            fi
+            for bname in "${budget_names[@]}"; do
+                [ -z "$bname" ] && continue
+                log_info "Sweeping leftover Budget: $bname..."
+                if ! aws budgets delete-budget --account-id "$ACCOUNT_ID" --budget-name "$bname" >/dev/null 2>&1; then
+                    log_warn "Failed to delete leftover Budget: $bname"
+                    add_failed_cleanup "budget"
+                else
+                    if [ "${TASK_BUDGET_NAME:-}" = "$bname" ]; then
+                        TASK_BUDGET_NAME=""
+                    fi
+                    log_success "Destroyed leftover Budget: $bname"
+                fi
+            done
+        fi
+    fi
+}
+
 cleanup_resources() {
+    if [ "$CLEANUP_PERFORMED" = true ]; then
+        return 0
+    fi
+    CLEANUP_PERFORMED=true
+
     log_info "\n=== CLEANING UP RESOURCES ==="
 
     if [ -n "${CURRENT_TASK:-}" ]; then
@@ -292,12 +486,15 @@ cleanup_resources() {
         fi
     done
 
+    # Sweep leftover freetier resources across instance, function, role, db, budget
+    sweep_leftovers
+
     # Residual temp files from plugins
     rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
 }
 
 handle_interrupt() {
-    trap - INT TERM
+    trap - INT TERM EXIT
     if [ -n "$SLEEP_PID" ]; then
         kill "$SLEEP_PID" 2>/dev/null || true
     fi
@@ -311,8 +508,36 @@ handle_interrupt() {
     exit 130
 }
 
-# Arm interrupt handler during provisioning phase
+handle_exit() {
+    local exit_code=$?
+    trap - EXIT
+    if [ "$CLEANUP_PERFORMED" != true ]; then
+        if [ -n "$SLEEP_PID" ]; then
+            kill "$SLEEP_PID" 2>/dev/null || true
+        fi
+        echo ""
+        if [ "$RUNNER_PHASE" = "wait" ]; then
+            log_warn "Interrupted during wait. Cleaning up provisioned resources..."
+        elif [ "$RUNNER_PHASE" = "provisioning" ]; then
+            log_warn "Interrupted during provisioning. Cleaning up provisioned resources..."
+        fi
+        cleanup_resources
+    fi
+    exit "$exit_code"
+}
+
+# Arm interrupt handler and exit trap during provisioning phase
 trap handle_interrupt INT TERM
+trap handle_exit EXIT
+
+if [ "$DO_SWEEP" = true ]; then
+    log_info "\nRunning standalone sweep for leftover freetier resources..."
+    sweep_leftovers
+    CLEANUP_PERFORMED=true
+    trap - INT TERM EXIT
+    log_success "\nLeftover sweep completed successfully!"
+    exit 0
+fi
 
 # --- PROVISIONING ---
 log_info "\n=== PROVISIONING RESOURCES ==="
@@ -358,7 +583,7 @@ echo "======================================================="
 RUNNER_PHASE="cleanup"
 cleanup_resources
 
-trap - INT TERM
+trap - INT TERM EXIT
 
 if [ ${#FAILED_PROVISIONS[@]} -gt 0 ] || [ ${#FAILED_CLEANUPS[@]} -gt 0 ]; then
     log_error "\n=== AUTOMATION SUMMARY: FAILURE ==="

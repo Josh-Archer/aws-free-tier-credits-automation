@@ -24,7 +24,17 @@ task_lambda_provision() {
     sleep "${LAMBDA_ROLE_WAIT:-10}"
 
     echo "def lambda_handler(event, context): return 'Hello Free Tier'" > main.py
-    if ! zip -q lambda.zip main.py; then
+    local zipped=false
+    if command -v zip >/dev/null 2>&1; then
+        if zip -q lambda.zip main.py; then
+            zipped=true
+        fi
+    elif command -v python3 >/dev/null 2>&1; then
+        if python3 -c "import zipfile; z=zipfile.ZipFile('lambda.zip','w'); z.write('main.py'); z.close()" >/dev/null 2>&1; then
+            zipped=true
+        fi
+    fi
+    if [ "$zipped" != true ]; then
         log_error "Failed to package lambda code."
         TASK_LAMBDA_NAME=""
         task_lambda_cleanup
