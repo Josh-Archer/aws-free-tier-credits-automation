@@ -441,8 +441,10 @@ except Exception:
                 ltags=$(aws lambda list-tags --resource "$fn" --output json 2>/dev/null || true)
                 local has_tag=false
                 if [ -n "$ltags" ]; then
-                    if echo "$ltags" | grep -q "\"freetier-run-id\": *\"$scope_run_id\""; then
-                        has_tag=true
+                    if command -v jq >/dev/null 2>&1; then
+                        echo "$ltags" | jq -e --arg s "$scope_run_id" '.Tags["freetier-run-id"] == $s' >/dev/null 2>&1 && has_tag=true
+                    elif command -v python3 >/dev/null 2>&1; then
+                        python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("Tags", {}).get("freetier-run-id") == sys.argv[1] else 1)' "$scope_run_id" <<< "$ltags" 2>/dev/null && has_tag=true
                     fi
                 fi
                 [ "$has_tag" = false ] && continue
@@ -549,8 +551,10 @@ except Exception:
                     btags=$(aws budgets list-tags-for-resource --resource-arn "$barn" --output json 2>/dev/null || true)
                     local has_tag=false
                     if [ -n "$btags" ]; then
-                        if echo "$btags" | grep -q "\"Key\": *\"freetier-run-id\", *\"Value\": *\"$scope_run_id\""; then
-                            has_tag=true
+                        if command -v jq >/dev/null 2>&1; then
+                            echo "$btags" | jq -e --arg s "$scope_run_id" '.ResourceTags[]? | select(.Key == "freetier-run-id" and .Value == $s)' >/dev/null 2>&1 && has_tag=true
+                        elif command -v python3 >/dev/null 2>&1; then
+                            python3 -c 'import json,sys; sys.exit(0 if any(t.get("Key") == "freetier-run-id" and t.get("Value") == sys.argv[1] for t in json.load(sys.stdin).get("ResourceTags", [])) else 1)' "$scope_run_id" <<< "$btags" 2>/dev/null && has_tag=true
                         fi
                     fi
                     [ "$has_tag" = false ] && continue

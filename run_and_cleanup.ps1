@@ -200,6 +200,9 @@ foreach ($t in $allTasks) {
 Write-Host "Verifying AWS CLI Identity..." -ForegroundColor Cyan
 try {
     $identity = aws sts get-caller-identity --query "{Account:Account, Arn:Arn}" --output json | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $identity.Account -or -not $identity.Arn) {
+        throw "AWS identity is unavailable"
+    }
     Write-Host "Account: $($identity.Account)"
     Write-Host "User Arn: $($identity.Arn)"
     Write-Host "Catalog last verified: $($catalog.last_verified)"
@@ -310,6 +313,8 @@ function Invoke-SweepLeftovers {
                     }
                 }
             }
+        } else {
+            $script:SweepErrors.Add("ec2: describe-instances") | Out-Null
         }
     } catch {
         Write-Host "Error sweeping EC2 instances: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -362,6 +367,8 @@ function Invoke-SweepLeftovers {
                     }
                 }
             }
+        } else {
+            $script:SweepErrors.Add("rds: describe-db-instances") | Out-Null
         }
     } catch {
         Write-Host "Error sweeping RDS databases: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -385,6 +392,8 @@ function Invoke-SweepLeftovers {
                                 if ($tagData.Tags -and $tagData.Tags."freetier-run-id" -eq $RunId) {
                                     $matches = $true
                                 }
+                            } else {
+                                $script:SweepErrors.Add("lambda tags: $($fn.FunctionName)") | Out-Null
                             }
                         }
                         if ($matches) {
@@ -408,6 +417,8 @@ function Invoke-SweepLeftovers {
                     }
                 }
             }
+        } else {
+            $script:SweepErrors.Add("lambda: list-functions") | Out-Null
         }
     } catch {
         Write-Host "Error sweeping Lambda functions: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -453,6 +464,8 @@ function Invoke-SweepLeftovers {
                     }
                 }
             }
+        } else {
+            $script:SweepErrors.Add("iam: list-roles") | Out-Null
         }
     } catch {
         Write-Host "Error sweeping IAM roles: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -483,6 +496,8 @@ function Invoke-SweepLeftovers {
                                             }
                                         }
                                     }
+                                } else {
+                                    $script:SweepErrors.Add("budget tags: $($b.BudgetName)") | Out-Null
                                 }
                             }
                             if ($matches) {
@@ -502,6 +517,8 @@ function Invoke-SweepLeftovers {
                             }
                         }
                     }
+                } else {
+                    $script:SweepErrors.Add("budget: describe-budgets") | Out-Null
                 }
             }
         } catch {
@@ -611,7 +628,10 @@ function Invoke-CleanupResources {
         }
     }
 
-    Invoke-SweepLeftovers -RunId $script:RunId -IsDryRun $false | Out-Null
+    $sweepErrorCount = Invoke-SweepLeftovers -RunId $script:RunId -IsDryRun $false
+    if ($sweepErrorCount -gt 0 -and -not $failedCleanups.Contains("sweep")) {
+        $failedCleanups.Add("sweep") | Out-Null
+    }
 
     # Residual temp files from plugins
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip, config.txt, profiles.txt

@@ -18,8 +18,7 @@ task_rds_provision() {
         --master-username admin \
         --master-user-password "FreeTierPassword123!" \
         --no-publicly-accessible \
-        --tags "Key=freetier-run-id,Value=$run_id" \
-        --skip-final-snapshot >/dev/null; then
+        --tags "Key=freetier-run-id,Value=$run_id" >/dev/null; then
         log_error "Failed to create RDS Database: $TASK_RDS_ID"
         TASK_RDS_ID=""
         return 1

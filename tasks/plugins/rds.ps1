@@ -20,8 +20,7 @@ function Invoke-TaskRdsProvision {
         --master-username admin `
         --master-user-password "FreeTierPassword123!" `
         --no-publicly-accessible `
-        --tags "Key=freetier-run-id,Value=$runId" `
-        --skip-final-snapshot | Out-Null
+        --tags "Key=freetier-run-id,Value=$runId" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create RDS Database: $dbName" -ForegroundColor Red
         if ($null -ne $script:CurrentTaskState) {

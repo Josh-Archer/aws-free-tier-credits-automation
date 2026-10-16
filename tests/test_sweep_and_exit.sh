@@ -22,6 +22,10 @@ sub="${2:-}"
 case "$cmd" in
     sts)
         if [ "$sub" = "get-caller-identity" ]; then
+            if [ "${FAIL_STS_IDENTITY:-0}" = "1" ]; then
+                echo "Unable to locate credentials" >&2
+                exit 99
+            fi
             echo '{"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/REDACTED_TEST_USER"}'
             exit 0
         fi
@@ -41,6 +45,10 @@ case "$cmd" in
                 exit 0
                 ;;
             describe-instances)
+                if [ "${FAIL_EC2_DESCRIBE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling DescribeInstances" >&2
+                    exit 1
+                fi
                 if [ "${EC2_HAS_LEFTOVERS:-0}" = "1" ]; then
                     cat << 'JSON'
 {
@@ -500,6 +508,12 @@ LOG_OUT="${TEST_TMP}/normal_rds_default_snap.log"
 WAIT_SECONDS=1 \
 bash "${REPO_DIR}/run_and_cleanup.sh" --only rds > "$LOG_OUT" 2>&1
 
+if grep "rds create-db-instance" "$AWS_LOG" | grep -q -- "--skip-final-snapshot"; then
+    echo "FAIL: RDS create-db-instance must not receive --skip-final-snapshot"
+    cat "$AWS_LOG"
+    exit 1
+fi
+
 grep -q "rds delete-db-instance --db-instance-identifier freetier-db-[0-9]* --final-db-snapshot-identifier freetier-db-[0-9]*-final-snapshot" "$AWS_LOG" || {
     echo "FAIL: Expected normal run RDS delete to take final snapshot by default"
     cat "$AWS_LOG"
@@ -632,6 +646,45 @@ if command -v pwsh >/dev/null 2>&1; then
         cat "$LOG_OUT"
         exit 1
     fi
+
+    # A standalone confirmed sweep must reject missing AWS identity before listing resources.
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_sweep_no_identity.log"
+    set +e
+    FAIL_STS_IDENTITY=1 \
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Sweep -Confirm > "$LOG_OUT" 2>&1
+    PWSH_EC=$?
+    set -e
+    if [ "$PWSH_EC" -eq 0 ]; then
+        echo "FAIL: Expected pwsh -Sweep -Confirm to reject a missing AWS identity"
+        cat "$LOG_OUT"
+        exit 1
+    fi
+    if [ "$(wc -l < "$AWS_LOG")" -ne 1 ] || ! grep -q "sts get-caller-identity" "$AWS_LOG"; then
+        echo "FAIL: Expected identity verification to stop the sweep before resource API calls"
+        cat "$AWS_LOG"
+        exit 1
+    fi
+
+    # Normal-run cleanup must retain sweep/list failures in its final exit status.
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_normal_sweep_fail.log"
+    set +e
+    WAIT_SECONDS=0 \
+    FAIL_EC2_DESCRIBE=1 \
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" > "$LOG_OUT" 2>&1
+    PWSH_EC=$?
+    set -e
+    if [ "$PWSH_EC" -eq 0 ]; then
+        echo "FAIL: Expected normal pwsh run to exit non-zero when cleanup sweep listing fails"
+        cat "$LOG_OUT"
+        exit 1
+    fi
+    grep -q "Cleanup failed for: sweep" "$LOG_OUT" || {
+        echo "FAIL: Expected normal pwsh summary to report cleanup sweep failure"
+        cat "$LOG_OUT"
+        exit 1
+    }
 
     echo "PASS: PowerShell runner sweep tests passed."
 fi
