@@ -17,8 +17,9 @@ function Invoke-TaskEc2Provision {
 
     Write-Host "Launching EC2 instance (t2.micro) with AMI $ami..."
     $instName = "freetier-ec2-$(Get-Random)"
+    $runId = if ($script:RunId) { $script:RunId } elseif ($env:RUN_ID) { $env:RUN_ID } else { "run-$(Get-Random)" }
     $instOutput = aws ec2 run-instances --image-id $ami --instance-type t2.micro `
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$instName}]" `
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$instName},{Key=freetier-run-id,Value=$runId}]" `
         --query "Instances[0].InstanceId" --output text
     $instanceId = ($instOutput -join "`n").Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($instanceId) -or $instanceId.ToLower() -eq "none") {

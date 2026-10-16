@@ -41,10 +41,19 @@ param (
     [string[]]$Only = @(),
     [switch]$ListTasks,
     [switch]$AutoCheck,
-    [switch]$Sweep
+    [switch]$Sweep,
+    [switch]$Confirm,
+    [switch]$Yes,
+    [switch]$Force,
+    [switch]$SkipFinalSnapshot,
+    [switch]$SkipRdsSnapshot
 )
 
 $ErrorActionPreference = "Stop"
+
+$script:RunId = if ($env:RUN_ID) { $env:RUN_ID } else { "run-$([System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds())-$(Get-Random)" }
+$env:RUN_ID = $script:RunId
+$script:SkipFinalSnapshot = ($SkipFinalSnapshot.IsPresent -or $SkipRdsSnapshot.IsPresent -or ($env:SKIP_FINAL_SNAPSHOT -eq "true"))
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CatalogPath = Join-Path $ScriptDir "tasks\catalog.json"
@@ -201,32 +210,102 @@ try {
 
 $script:TaskAccountId = $identity.Account
 
+if (-not (Get-Command Remove-TaskIamRole -ErrorAction SilentlyContinue)) {
+    function Remove-TaskIamRole {
+        param([string]$RoleName)
+        if (-not $RoleName) { return }
+        try {
+            $attachedRaw = aws iam list-attached-role-policies --role-name $RoleName --output json 2>$null
+            if ($LASTEXITCODE -eq 0 -and $attachedRaw) {
+                $attachedData = $attachedRaw | ConvertFrom-Json
+                if ($attachedData -and $attachedData.AttachedPolicies) {
+                    foreach ($pol in $attachedData.AttachedPolicies) {
+                        if ($pol.PolicyArn) {
+                            Write-Host "Detaching policy $($pol.PolicyArn) from role $RoleName..." -ForegroundColor Cyan
+                            aws iam detach-role-policy --role-name $RoleName --policy-arn $pol.PolicyArn 2>$null | Out-Null
+                        }
+                    }
+                }
+            }
+        } catch { }
+        try {
+            $inlineRaw = aws iam list-role-policies --role-name $RoleName --output json 2>$null
+            if ($LASTEXITCODE -eq 0 -and $inlineRaw) {
+                $inlineData = $inlineRaw | ConvertFrom-Json
+                if ($inlineData -and $inlineData.PolicyNames) {
+                    foreach ($pName in $inlineData.PolicyNames) {
+                        if ($pName) {
+                            Write-Host "Deleting inline policy $pName from role $RoleName..." -ForegroundColor Cyan
+                            aws iam delete-role-policy --role-name $RoleName --policy-name $pName 2>$null | Out-Null
+                        }
+                    }
+                }
+            }
+        } catch { }
+        aws iam delete-role --role-name $RoleName 2>$null | Out-Null
+    }
+}
+
 function Invoke-SweepLeftovers {
-    Write-Host "`nSweeping leftover freetier resources..." -ForegroundColor Cyan
+    param(
+        [string]$RunId = "",
+        [bool]$IsDryRun = $false
+    )
+
+    if ($IsDryRun) {
+        Write-Host "Scanning for leftover freetier resources (dry run)..." -ForegroundColor Cyan
+    } elseif ($RunId) {
+        Write-Host "`nCleaning up leftover resources for run $RunId..." -ForegroundColor Cyan
+    } else {
+        Write-Host "`nSweeping leftover freetier resources..." -ForegroundColor Cyan
+    }
+
+    $foundCount = 0
+    $script:SweepErrors = New-Object System.Collections.Generic.List[string]
 
     # 1. EC2 Instances
     try {
-        $ec2Raw = aws ec2 describe-instances `
-            --filters "Name=tag:Name,Values=freetier-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" `
-            --output json 2>$null
+        $filterArgs = if ($RunId) {
+            @("--filters", "Name=tag:freetier-run-id,Values=$RunId", "Name=instance-state-name,Values=pending,running,stopping,stopped")
+        } else {
+            @("--filters", "Name=tag:Name,Values=freetier-*", "Name=instance-state-name,Values=pending,running,stopping,stopped")
+        }
+        $ec2Raw = aws ec2 describe-instances @filterArgs --output json 2>$null
         if ($LASTEXITCODE -eq 0 -and $ec2Raw) {
             $ec2Data = $ec2Raw | ConvertFrom-Json
             if ($ec2Data -and $ec2Data.Reservations) {
                 foreach ($res in $ec2Data.Reservations) {
                     foreach ($inst in $res.Instances) {
-                        $hasFreetierTag = $false
+                        $matches = $false
                         if ($inst.Tags) {
                             foreach ($tag in $inst.Tags) {
-                                if ($tag.Key -eq "Name" -and $tag.Value -and $tag.Value.StartsWith("freetier-")) {
-                                    $hasFreetierTag = $true
-                                    break
+                                if ($RunId) {
+                                    if ($tag.Key -eq "freetier-run-id" -and $tag.Value -eq $RunId) {
+                                        $matches = $true
+                                        break
+                                    }
+                                } else {
+                                    if ($tag.Key -eq "Name" -and $tag.Value -and $tag.Value.StartsWith("freetier-")) {
+                                        $matches = $true
+                                        break
+                                    }
                                 }
                             }
                         }
-                        if ($hasFreetierTag -and $inst.InstanceId) {
-                            Write-Host "Sweeping leftover EC2 Instance: $($inst.InstanceId)..." -ForegroundColor Cyan
-                            aws ec2 terminate-instances --instance-ids $inst.InstanceId | Out-Null
-                            Write-Host "Terminated leftover EC2 Instance: $($inst.InstanceId)" -ForegroundColor Green
+                        if ($matches -and $inst.InstanceId) {
+                            $foundCount++
+                            if ($IsDryRun) {
+                                Write-Host "[DRY RUN] Found leftover EC2 Instance: $($inst.InstanceId)" -ForegroundColor Cyan
+                            } else {
+                                Write-Host "Sweeping leftover EC2 Instance: $($inst.InstanceId)..." -ForegroundColor Cyan
+                                aws ec2 terminate-instances --instance-ids $inst.InstanceId | Out-Null
+                                if ($LASTEXITCODE -ne 0) {
+                                    Write-Host "Failed to terminate leftover EC2 instance: $($inst.InstanceId)" -ForegroundColor Red
+                                    $script:SweepErrors.Add("ec2: $($inst.InstanceId)") | Out-Null
+                                } else {
+                                    Write-Host "Terminated leftover EC2 Instance: $($inst.InstanceId)" -ForegroundColor Green
+                                }
+                            }
                         }
                     }
                 }
@@ -234,6 +313,7 @@ function Invoke-SweepLeftovers {
         }
     } catch {
         Write-Host "Error sweeping EC2 instances: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:SweepErrors.Add("ec2: $($_.Exception.Message)") | Out-Null
     }
 
     # 2. RDS Databases
@@ -243,16 +323,49 @@ function Invoke-SweepLeftovers {
             $rdsData = $rdsRaw | ConvertFrom-Json
             if ($rdsData -and $rdsData.DBInstances) {
                 foreach ($db in $rdsData.DBInstances) {
-                    if ($db.DBInstanceIdentifier -and $db.DBInstanceIdentifier.StartsWith("freetier-") -and $db.DBInstanceStatus -ne "deleting") {
-                        Write-Host "Sweeping leftover RDS Database: $($db.DBInstanceIdentifier)..." -ForegroundColor Cyan
-                        aws rds delete-db-instance --db-instance-identifier $db.DBInstanceIdentifier --skip-final-snapshot | Out-Null
-                        Write-Host "Destroyed leftover RDS Database: $($db.DBInstanceIdentifier)" -ForegroundColor Green
+                    if ($db.DBInstanceStatus -eq "deleting") { continue }
+                    $matches = $false
+                    if ($RunId) {
+                        if ($db.TagList) {
+                            foreach ($tag in $db.TagList) {
+                                if ($tag.Key -eq "freetier-run-id" -and $tag.Value -eq $RunId) {
+                                    $matches = $true
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        if ($db.DBInstanceIdentifier -and $db.DBInstanceIdentifier.StartsWith("freetier-")) {
+                            $matches = $true
+                        }
+                    }
+                    if ($matches -and $db.DBInstanceIdentifier) {
+                        $foundCount++
+                        if ($IsDryRun) {
+                            Write-Host "[DRY RUN] Found leftover RDS Database: $($db.DBInstanceIdentifier)" -ForegroundColor Cyan
+                        } else {
+                            Write-Host "Sweeping leftover RDS Database: $($db.DBInstanceIdentifier)..." -ForegroundColor Cyan
+                            $skipSnap = ($script:SkipFinalSnapshot -or ($env:SKIP_FINAL_SNAPSHOT -eq "true"))
+                            if ($skipSnap) {
+                                aws rds delete-db-instance --db-instance-identifier $db.DBInstanceIdentifier --skip-final-snapshot | Out-Null
+                            } else {
+                                $snapId = "$($db.DBInstanceIdentifier)-final-snapshot"
+                                aws rds delete-db-instance --db-instance-identifier $db.DBInstanceIdentifier --final-db-snapshot-identifier $snapId | Out-Null
+                            }
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Host "Failed to delete leftover RDS database: $($db.DBInstanceIdentifier)" -ForegroundColor Red
+                                $script:SweepErrors.Add("rds: $($db.DBInstanceIdentifier)") | Out-Null
+                            } else {
+                                Write-Host "Destroyed leftover RDS Database: $($db.DBInstanceIdentifier)" -ForegroundColor Green
+                            }
+                        }
                     }
                 }
             }
         }
     } catch {
         Write-Host "Error sweeping RDS databases: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:SweepErrors.Add("rds: $($_.Exception.Message)") | Out-Null
     }
 
     # 3. Lambda Functions
@@ -263,15 +376,42 @@ function Invoke-SweepLeftovers {
             if ($lambdaData -and $lambdaData.Functions) {
                 foreach ($fn in $lambdaData.Functions) {
                     if ($fn.FunctionName -and $fn.FunctionName.StartsWith("freetier-")) {
-                        Write-Host "Sweeping leftover Lambda Function: $($fn.FunctionName)..." -ForegroundColor Cyan
-                        aws lambda delete-function --function-name $fn.FunctionName | Out-Null
-                        Write-Host "Destroyed leftover Lambda Function: $($fn.FunctionName)" -ForegroundColor Green
+                        $matches = $true
+                        if ($RunId) {
+                            $matches = $false
+                            $tagRaw = aws lambda list-tags --resource $fn.FunctionName --output json 2>$null
+                            if ($LASTEXITCODE -eq 0 -and $tagRaw) {
+                                $tagData = $tagRaw | ConvertFrom-Json
+                                if ($tagData.Tags -and $tagData.Tags."freetier-run-id" -eq $RunId) {
+                                    $matches = $true
+                                }
+                            }
+                        }
+                        if ($matches) {
+                            $foundCount++
+                            if ($IsDryRun) {
+                                Write-Host "[DRY RUN] Found leftover Lambda Function: $($fn.FunctionName)" -ForegroundColor Cyan
+                            } else {
+                                Write-Host "Sweeping leftover Lambda Function: $($fn.FunctionName)..." -ForegroundColor Cyan
+                                $delOut = aws lambda delete-function --function-name $fn.FunctionName 2>&1
+                                if ($LASTEXITCODE -ne 0) {
+                                    $delStr = ($delOut | Out-String)
+                                    if ($delStr -notmatch "ResourceNotFoundException") {
+                                        Write-Host "Failed to delete leftover Lambda function: $($fn.FunctionName)" -ForegroundColor Red
+                                        $script:SweepErrors.Add("lambda: $($fn.FunctionName)") | Out-Null
+                                    }
+                                } else {
+                                    Write-Host "Destroyed leftover Lambda Function: $($fn.FunctionName)" -ForegroundColor Green
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
     } catch {
         Write-Host "Error sweeping Lambda functions: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:SweepErrors.Add("lambda: $($_.Exception.Message)") | Out-Null
     }
 
     # 4. IAM Roles
@@ -281,16 +421,42 @@ function Invoke-SweepLeftovers {
             $iamData = $iamRaw | ConvertFrom-Json
             if ($iamData -and $iamData.Roles) {
                 foreach ($role in $iamData.Roles) {
-                    if ($role.RoleName -and $role.RoleName.StartsWith("freetier-")) {
-                        Write-Host "Sweeping leftover IAM Role: $($role.RoleName)..." -ForegroundColor Cyan
-                        aws iam delete-role --role-name $role.RoleName | Out-Null
-                        Write-Host "Destroyed leftover IAM Role: $($role.RoleName)" -ForegroundColor Green
+                    $matches = $false
+                    if ($RunId) {
+                        if ($role.Tags) {
+                            foreach ($tag in $role.Tags) {
+                                if ($tag.Key -eq "freetier-run-id" -and $tag.Value -eq $RunId) {
+                                    $matches = $true
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        if ($role.RoleName -and $role.RoleName.StartsWith("freetier-")) {
+                            $matches = $true
+                        }
+                    }
+                    if ($matches -and $role.RoleName) {
+                        $foundCount++
+                        if ($IsDryRun) {
+                            Write-Host "[DRY RUN] Found leftover IAM Role: $($role.RoleName)" -ForegroundColor Cyan
+                        } else {
+                            Write-Host "Sweeping leftover IAM Role: $($role.RoleName)..." -ForegroundColor Cyan
+                            Remove-TaskIamRole -RoleName $role.RoleName
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Host "Failed to delete leftover IAM role: $($role.RoleName)" -ForegroundColor Red
+                                $script:SweepErrors.Add("iam: $($role.RoleName)") | Out-Null
+                            } else {
+                                Write-Host "Destroyed leftover IAM Role: $($role.RoleName)" -ForegroundColor Green
+                            }
+                        }
                     }
                 }
             }
         }
     } catch {
         Write-Host "Error sweeping IAM roles: $($_.Exception.Message)" -ForegroundColor Yellow
+        $script:SweepErrors.Add("iam: $($_.Exception.Message)") | Out-Null
     }
 
     # 5. Budgets
@@ -302,24 +468,76 @@ function Invoke-SweepLeftovers {
                 if ($budgetData -and $budgetData.Budgets) {
                     foreach ($b in $budgetData.Budgets) {
                         if ($b.BudgetName -and $b.BudgetName.StartsWith("freetier-")) {
-                            Write-Host "Sweeping leftover Budget: $($b.BudgetName)..." -ForegroundColor Cyan
-                            aws budgets delete-budget --account-id $script:TaskAccountId --budget-name $b.BudgetName | Out-Null
-                            Write-Host "Destroyed leftover Budget: $($b.BudgetName)" -ForegroundColor Green
+                            $matches = $true
+                            if ($RunId) {
+                                $matches = $false
+                                $bArn = "arn:aws:budgets::$($script:TaskAccountId):budget/$($b.BudgetName)"
+                                $bTagRaw = aws budgets list-tags-for-resource --resource-arn $bArn --output json 2>$null
+                                if ($LASTEXITCODE -eq 0 -and $bTagRaw) {
+                                    $bTagData = $bTagRaw | ConvertFrom-Json
+                                    if ($bTagData.ResourceTags) {
+                                        foreach ($tag in $bTagData.ResourceTags) {
+                                            if ($tag.Key -eq "freetier-run-id" -and $tag.Value -eq $RunId) {
+                                                $matches = $true
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if ($matches) {
+                                $foundCount++
+                                if ($IsDryRun) {
+                                    Write-Host "[DRY RUN] Found leftover Budget: $($b.BudgetName)" -ForegroundColor Cyan
+                                } else {
+                                    Write-Host "Sweeping leftover Budget: $($b.BudgetName)..." -ForegroundColor Cyan
+                                    aws budgets delete-budget --account-id $script:TaskAccountId --budget-name $b.BudgetName | Out-Null
+                                    if ($LASTEXITCODE -ne 0) {
+                                        Write-Host "Failed to delete leftover Budget: $($b.BudgetName)" -ForegroundColor Red
+                                        $script:SweepErrors.Add("budget: $($b.BudgetName)") | Out-Null
+                                    } else {
+                                        Write-Host "Destroyed leftover Budget: $($b.BudgetName)" -ForegroundColor Green
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         } catch {
             Write-Host "Error sweeping Budgets: $($_.Exception.Message)" -ForegroundColor Yellow
+            $script:SweepErrors.Add("budget: $($_.Exception.Message)") | Out-Null
         }
     }
+
+    if ($IsDryRun) {
+        if ($foundCount -eq 0) {
+            Write-Host "No leftover freetier resources found." -ForegroundColor Green
+        } else {
+            Write-Host "`nDry run complete: Found $foundCount leftover resource(s)." -ForegroundColor Yellow
+            Write-Host "To delete these resources, re-run with -Confirm or -Yes." -ForegroundColor Yellow
+        }
+    }
+
+    return $script:SweepErrors.Count
 }
 
 if ($Sweep) {
-    Write-Host "`nRunning standalone sweep for leftover freetier resources..." -ForegroundColor Cyan
-    Invoke-SweepLeftovers
-    Write-Host "`nLeftover sweep completed successfully!" -ForegroundColor Green
-    exit 0
+    $isConfirmed = $Confirm.IsPresent -or $Yes.IsPresent -or $Force.IsPresent
+    if (-not $isConfirmed) {
+        Write-Host "`nRunning standalone sweep dry run for leftover freetier resources..." -ForegroundColor Cyan
+        Invoke-SweepLeftovers -RunId "" -IsDryRun $true | Out-Null
+        exit 0
+    } else {
+        Write-Host "`nRunning standalone sweep for leftover freetier resources (confirmed)..." -ForegroundColor Cyan
+        $errCount = Invoke-SweepLeftovers -RunId "" -IsDryRun $false
+        if ($errCount -gt 0) {
+            Write-Host "`nLeftover sweep completed with $errCount error(s)." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "`nLeftover sweep completed successfully!" -ForegroundColor Green
+        exit 0
+    }
 }
 
 # --- PRE-FLIGHT PERMISSION CHECK ---
@@ -393,7 +611,7 @@ function Invoke-CleanupResources {
         }
     }
 
-    Invoke-SweepLeftovers
+    Invoke-SweepLeftovers -RunId $script:RunId -IsDryRun $false | Out-Null
 
     # Residual temp files from plugins
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip, config.txt, profiles.txt

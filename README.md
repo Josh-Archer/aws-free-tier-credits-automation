@@ -85,16 +85,18 @@ Because AWS does not provide an API to check your Promotional Credit balance pro
 | `-EnableEC2 / -EnableRDS / -EnableLambda / -EnableBudget` | `--skip-<id>` | Legacy per-task enable (PS) or skip (bash) |
 | `-Skip id1,id2` | `--skip-id` (repeatable) | Skip listed catalog ids |
 | `-Only id1,id2` | `--only id1,id2` | Run only these ids |
-| `-Sweep` | `--sweep` | Sweep and destroy leftover freetier resources |
+| `-Sweep` | `--sweep` | Sweep leftover freetier resources (defaults to dry-run listing) |
+| `-Confirm / -Yes / -Force` | `--confirm / --yes` | Confirm deletion when running standalone sweep |
+| `-SkipFinalSnapshot` | `--skip-final-snapshot` | Skip final DB snapshot during RDS deletion (default: snapshot taken) |
 | `-ListTasks` | `--list-tasks` | Print catalog and exit |
 | `-AutoCheck` | `--auto-check` | Explain credit API limitation |
 
 ## How it Works
 1. **Catalog load**: Reads `tasks/catalog.json` and sources matching plugins.
 2. **Pre-flight Check**: Verifies `aws sts get-caller-identity` and permission checks for enabled tasks.
-3. **Provisioning**: Each enabled plugin creates its minimal resources via the `aws` CLI.
+3. **Provisioning**: Each enabled plugin creates its minimal resources via the `aws` CLI, tagged with a unique run id (`freetier-run-id`).
 4. **Tracking Delay**: Sleeps for 3 minutes so billing systems can detect activity.
-5. **Cleanup**: Plugins destroy resources they created (reverse order) and sweep any leftover resources prefixed `freetier-`. Runners install an EXIT trap (Bash) and `finally` block (PowerShell) so abnormal exits, failures, or interruptions (Ctrl-C) during provisioning or the wait cannot skip cleanup.
+5. **Cleanup**: Plugins destroy resources they created (reverse order) and clean up leftover resources scoped to this run's unique run id tag (never touching other `freetier-*` resources in the account). RDS deletions take a final snapshot by default (skipped only with `--skip-final-snapshot`). IAM role deletions detach attached policies and delete inline policies before deleting the role. Runners install an EXIT trap (Bash) and `finally` block (PowerShell) so abnormal exits, failures, or interruptions (Ctrl-C) during provisioning or the wait cannot skip cleanup. Standalone sweep (`--sweep`) defaults to a dry-run listing and requires explicit confirmation (`--confirm` or `--yes`) to delete account-wide freetier leftovers.
 
 ### Expanding coverage when AWS changes the program
 1. Confirm new earned-credit tasks in the AWS Free Tier / Billing console.

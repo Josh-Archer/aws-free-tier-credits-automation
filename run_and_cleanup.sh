@@ -74,8 +74,14 @@ for id in "${ALL_TASK_IDS[@]}"; do
 done
 
 DO_SWEEP=false
+CONFIRM_SWEEP=false
 AUTO_CHECK=false
 LIST_TASKS=false
+SKIP_FINAL_SNAPSHOT="${SKIP_FINAL_SNAPSHOT:-false}"
+export SKIP_FINAL_SNAPSHOT
+
+RUN_ID="${RUN_ID:-run-$(date +%s)-$RANDOM}"
+export RUN_ID
 
 usage() {
     echo "Usage: $0 [options]"
@@ -88,7 +94,9 @@ usage() {
         printf "  --skip-%-8s Skip task: %s\n" "$id" "$id"
     done
     echo "  --only IDS      Comma-separated task ids to run exclusively (e.g. ec2,lambda)"
-    echo "  --sweep         Sweep and destroy leftover freetier resources and exit"
+    echo "  --sweep         Sweep leftover freetier resources (defaults to dry-run listing)"
+    echo "  --confirm, --yes Confirm deletion when running --sweep"
+    echo "  --skip-final-snapshot Skip final DB snapshot during RDS deletion (default: snapshot taken)"
     echo "  --list-tasks    List catalog tasks (id, credit, description) and exit"
     echo "  --auto-check    Display info about AWS credit checking limitations"
     echo "  --help          Display this help message"
@@ -124,6 +132,8 @@ while [[ $# -gt 0 ]]; do
         --auto-check) AUTO_CHECK=true ;;
         --list-tasks) LIST_TASKS=true ;;
         --sweep) DO_SWEEP=true ;;
+        --confirm|--yes) CONFIRM_SWEEP=true ;;
+        --skip-final-snapshot|--skip-rds-snapshot) SKIP_FINAL_SNAPSHOT=true ;;
         --only)
             shift
             if [[ $# -eq 0 ]]; then
@@ -265,44 +275,84 @@ add_failed_cleanup() {
     FAILED_CLEANUPS+=("$task_id")
 }
 
+if ! declare -f delete_iam_role >/dev/null; then
+    delete_iam_role() {
+        local r="$1"
+        aws iam delete-role --role-name "$r"
+    }
+fi
+
 sweep_leftovers() {
-    log_info "Sweeping leftover freetier resources..."
+    local scope_run_id="${1:-}"
+    local is_dry_run="${2:-false}"
+
+    if [ "$is_dry_run" = "true" ]; then
+        log_info "Scanning for leftover freetier resources (dry run)..."
+    elif [ -n "$scope_run_id" ]; then
+        log_info "Cleaning up leftover resources for run $scope_run_id..."
+    else
+        log_info "Sweeping leftover freetier resources..."
+    fi
+
+    local found_count=0
 
     # 1. EC2 Instances
     local raw_ec2
-    if raw_ec2=$(aws ec2 describe-instances \
-        --filters "Name=tag:Name,Values=freetier-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-        --output json 2>/dev/null); then
+    local -a ec2_cmd
+    ec2_cmd=(aws ec2 describe-instances)
+    if [ -n "$scope_run_id" ]; then
+        ec2_cmd+=(--filters "Name=tag:freetier-run-id,Values=$scope_run_id" "Name=instance-state-name,Values=pending,running,stopping,stopped")
+    else
+        ec2_cmd+=(--filters "Name=tag:Name,Values=freetier-*" "Name=instance-state-name,Values=pending,running,stopping,stopped")
+    fi
+    ec2_cmd+=(--output json)
+
+    if raw_ec2=$("${ec2_cmd[@]}" 2>/dev/null); then
         local ec2_ids=()
         if command -v jq >/dev/null 2>&1; then
-            mapfile -t ec2_ids < <(echo "$raw_ec2" | jq -r '.Reservations[]?.Instances[]? | select(.Tags[]? | select((.Key // "") == "Name" and ((.Value // "") | startswith("freetier-")))) | .InstanceId // empty' 2>/dev/null)
+            if [ -n "$scope_run_id" ]; then
+                mapfile -t ec2_ids < <(echo "$raw_ec2" | jq -r --arg s "$scope_run_id" '.Reservations[]?.Instances[]? | select(.Tags[]? | select((.Key // "") == "freetier-run-id" and (.Value // "") == $s)) | .InstanceId // empty' 2>/dev/null)
+            else
+                mapfile -t ec2_ids < <(echo "$raw_ec2" | jq -r '.Reservations[]?.Instances[]? | select(.Tags[]? | select((.Key // "") == "Name" and ((.Value // "") | startswith("freetier-")))) | .InstanceId // empty' 2>/dev/null)
+            fi
         elif command -v python3 >/dev/null 2>&1; then
             mapfile -t ec2_ids < <(python3 -c "
 import sys, json
 try:
     d = json.loads(sys.argv[1])
+    scope = sys.argv[2]
     for r in d.get('Reservations', []):
         for inst in r.get('Instances', []):
             tags = {t.get('Key'): t.get('Value', '') for t in inst.get('Tags', [])}
-            name = tags.get('Name', '')
-            if name.startswith('freetier-'):
-                iid = inst.get('InstanceId')
-                if iid: print(iid)
+            if scope:
+                if tags.get('freetier-run-id') == scope:
+                    iid = inst.get('InstanceId')
+                    if iid: print(iid)
+            else:
+                name = tags.get('Name', '')
+                if name.startswith('freetier-'):
+                    iid = inst.get('InstanceId')
+                    if iid: print(iid)
 except Exception:
     pass
-" "$raw_ec2" 2>/dev/null)
+" "$raw_ec2" "$scope_run_id" 2>/dev/null)
         fi
         for iid in "${ec2_ids[@]}"; do
             [ -z "$iid" ] && continue
-            log_info "Sweeping leftover EC2 Instance: $iid..."
-            if ! aws ec2 terminate-instances --instance-ids "$iid" >/dev/null 2>&1; then
-                log_warn "Failed to terminate leftover EC2 instance: $iid"
-                add_failed_cleanup "ec2"
+            found_count=$((found_count + 1))
+            if [ "$is_dry_run" = "true" ]; then
+                log_info "[DRY RUN] Found leftover EC2 Instance: $iid"
             else
-                if [ "${TASK_EC2_INSTANCE_ID:-}" = "$iid" ]; then
-                    TASK_EC2_INSTANCE_ID=""
+                log_info "Sweeping leftover EC2 Instance: $iid..."
+                if ! aws ec2 terminate-instances --instance-ids "$iid" >/dev/null 2>&1; then
+                    log_warn "Failed to terminate leftover EC2 instance: $iid"
+                    add_failed_cleanup "ec2"
+                else
+                    if [ "${TASK_EC2_INSTANCE_ID:-}" = "$iid" ]; then
+                        TASK_EC2_INSTANCE_ID=""
+                    fi
+                    log_success "Terminated leftover EC2 Instance: $iid"
                 fi
-                log_success "Terminated leftover EC2 Instance: $iid"
             fi
         done
     fi
@@ -312,32 +362,55 @@ except Exception:
     if raw_rds=$(aws rds describe-db-instances --output json 2>/dev/null); then
         local rds_ids=()
         if command -v jq >/dev/null 2>&1; then
-            mapfile -t rds_ids < <(echo "$raw_rds" | jq -r '.DBInstances[]? | select((.DBInstanceIdentifier // "") | startswith("freetier-")) | select((.DBInstanceStatus // "") != "deleting") | .DBInstanceIdentifier' 2>/dev/null)
+            if [ -n "$scope_run_id" ]; then
+                mapfile -t rds_ids < <(echo "$raw_rds" | jq -r --arg s "$scope_run_id" '.DBInstances[]? | select((.DBInstanceStatus // "") != "deleting") | select(.TagList[]? | select((.Key // "") == "freetier-run-id" and (.Value // "") == $s)) | .DBInstanceIdentifier' 2>/dev/null)
+            else
+                mapfile -t rds_ids < <(echo "$raw_rds" | jq -r '.DBInstances[]? | select((.DBInstanceIdentifier // "") | startswith("freetier-")) | select((.DBInstanceStatus // "") != "deleting") | .DBInstanceIdentifier' 2>/dev/null)
+            fi
         elif command -v python3 >/dev/null 2>&1; then
             mapfile -t rds_ids < <(python3 -c "
 import sys, json
 try:
     d = json.loads(sys.argv[1])
+    scope = sys.argv[2]
     for db in d.get('DBInstances', []):
         did = db.get('DBInstanceIdentifier', '')
         st = db.get('DBInstanceStatus', '')
-        if did.startswith('freetier-') and st != 'deleting':
-            print(did)
+        if st == 'deleting':
+            continue
+        tags = {t.get('Key'): t.get('Value', '') for t in db.get('TagList', [])}
+        if scope:
+            if tags.get('freetier-run-id') == scope:
+                print(did)
+        else:
+            if did.startswith('freetier-'):
+                print(did)
 except Exception:
     pass
-" "$raw_rds" 2>/dev/null)
+" "$raw_rds" "$scope_run_id" 2>/dev/null)
         fi
         for did in "${rds_ids[@]}"; do
             [ -z "$did" ] && continue
-            log_info "Sweeping leftover RDS Database: $did..."
-            if ! aws rds delete-db-instance --db-instance-identifier "$did" --skip-final-snapshot >/dev/null 2>&1; then
-                log_warn "Failed to delete leftover RDS database: $did"
-                add_failed_cleanup "rds"
+            found_count=$((found_count + 1))
+            if [ "$is_dry_run" = "true" ]; then
+                log_info "[DRY RUN] Found leftover RDS Database: $did"
             else
-                if [ "${TASK_RDS_ID:-}" = "$did" ]; then
-                    TASK_RDS_ID=""
+                log_info "Sweeping leftover RDS Database: $did..."
+                local -a snap_args
+                if [ "${SKIP_FINAL_SNAPSHOT:-false}" = "true" ]; then
+                    snap_args=(--skip-final-snapshot)
+                else
+                    snap_args=(--final-db-snapshot-identifier "${did}-final-snapshot")
                 fi
-                log_success "Destroyed leftover RDS Database: $did"
+                if ! aws rds delete-db-instance --db-instance-identifier "$did" "${snap_args[@]}" >/dev/null 2>&1; then
+                    log_warn "Failed to delete leftover RDS database: $did"
+                    add_failed_cleanup "rds"
+                else
+                    if [ "${TASK_RDS_ID:-}" = "$did" ]; then
+                        TASK_RDS_ID=""
+                    fi
+                    log_success "Destroyed leftover RDS Database: $did"
+                fi
             fi
         done
     fi
@@ -363,22 +436,38 @@ except Exception:
         fi
         for fn in "${lambda_fns[@]}"; do
             [ -z "$fn" ] && continue
-            log_info "Sweeping leftover Lambda Function: $fn..."
-            local del_err
-            if ! del_err=$(aws lambda delete-function --function-name "$fn" 2>&1); then
-                if [[ ! "$del_err" =~ ResourceNotFoundException ]]; then
-                    log_warn "Failed to delete leftover Lambda function: $fn"
-                    add_failed_cleanup "lambda"
+            if [ -n "$scope_run_id" ]; then
+                local ltags
+                ltags=$(aws lambda list-tags --resource "$fn" --output json 2>/dev/null || true)
+                local has_tag=false
+                if [ -n "$ltags" ]; then
+                    if echo "$ltags" | grep -q "\"freetier-run-id\": *\"$scope_run_id\""; then
+                        has_tag=true
+                    fi
+                fi
+                [ "$has_tag" = false ] && continue
+            fi
+            found_count=$((found_count + 1))
+            if [ "$is_dry_run" = "true" ]; then
+                log_info "[DRY RUN] Found leftover Lambda Function: $fn"
+            else
+                log_info "Sweeping leftover Lambda Function: $fn..."
+                local del_err
+                if ! del_err=$(aws lambda delete-function --function-name "$fn" 2>&1); then
+                    if [[ ! "$del_err" =~ ResourceNotFoundException ]]; then
+                        log_warn "Failed to delete leftover Lambda function: $fn"
+                        add_failed_cleanup "lambda"
+                    else
+                        if [ "${TASK_LAMBDA_NAME:-}" = "$fn" ]; then
+                            TASK_LAMBDA_NAME=""
+                        fi
+                    fi
                 else
                     if [ "${TASK_LAMBDA_NAME:-}" = "$fn" ]; then
                         TASK_LAMBDA_NAME=""
                     fi
+                    log_success "Destroyed leftover Lambda Function: $fn"
                 fi
-            else
-                if [ "${TASK_LAMBDA_NAME:-}" = "$fn" ]; then
-                    TASK_LAMBDA_NAME=""
-                fi
-                log_success "Destroyed leftover Lambda Function: $fn"
             fi
         done
     fi
@@ -388,31 +477,46 @@ except Exception:
     if raw_iam=$(aws iam list-roles --output json 2>/dev/null); then
         local iam_roles=()
         if command -v jq >/dev/null 2>&1; then
-            mapfile -t iam_roles < <(echo "$raw_iam" | jq -r '.Roles[]? | select((.RoleName // "") | startswith("freetier-")) | .RoleName' 2>/dev/null)
+            if [ -n "$scope_run_id" ]; then
+                mapfile -t iam_roles < <(echo "$raw_iam" | jq -r --arg s "$scope_run_id" '.Roles[]? | select(.Tags[]? | select((.Key // "") == "freetier-run-id" and (.Value // "") == $s)) | .RoleName' 2>/dev/null)
+            else
+                mapfile -t iam_roles < <(echo "$raw_iam" | jq -r '.Roles[]? | select((.RoleName // "") | startswith("freetier-")) | .RoleName' 2>/dev/null)
+            fi
         elif command -v python3 >/dev/null 2>&1; then
             mapfile -t iam_roles < <(python3 -c "
 import sys, json
 try:
     d = json.loads(sys.argv[1])
+    scope = sys.argv[2]
     for role in d.get('Roles', []):
         rname = role.get('RoleName', '')
-        if rname.startswith('freetier-'):
-            print(rname)
+        tags = {t.get('Key'): t.get('Value', '') for t in role.get('Tags', [])}
+        if scope:
+            if tags.get('freetier-run-id') == scope:
+                print(rname)
+        else:
+            if rname.startswith('freetier-'):
+                print(rname)
 except Exception:
     pass
-" "$raw_iam" 2>/dev/null)
+" "$raw_iam" "$scope_run_id" 2>/dev/null)
         fi
         for rname in "${iam_roles[@]}"; do
             [ -z "$rname" ] && continue
-            log_info "Sweeping leftover IAM Role: $rname..."
-            if ! aws iam delete-role --role-name "$rname" >/dev/null 2>&1; then
-                log_warn "Failed to delete leftover IAM role: $rname"
-                add_failed_cleanup "lambda"
+            found_count=$((found_count + 1))
+            if [ "$is_dry_run" = "true" ]; then
+                log_info "[DRY RUN] Found leftover IAM Role: $rname"
             else
-                if [ "${TASK_LAMBDA_ROLE:-}" = "$rname" ]; then
-                    TASK_LAMBDA_ROLE=""
+                log_info "Sweeping leftover IAM Role: $rname..."
+                if ! delete_iam_role "$rname" >/dev/null 2>&1; then
+                    log_warn "Failed to delete leftover IAM role: $rname"
+                    add_failed_cleanup "lambda"
+                else
+                    if [ "${TASK_LAMBDA_ROLE:-}" = "$rname" ]; then
+                        TASK_LAMBDA_ROLE=""
+                    fi
+                    log_success "Destroyed leftover IAM Role: $rname"
                 fi
-                log_success "Destroyed leftover IAM Role: $rname"
             fi
         done
     fi
@@ -439,17 +543,43 @@ except Exception:
             fi
             for bname in "${budget_names[@]}"; do
                 [ -z "$bname" ] && continue
-                log_info "Sweeping leftover Budget: $bname..."
-                if ! aws budgets delete-budget --account-id "$ACCOUNT_ID" --budget-name "$bname" >/dev/null 2>&1; then
-                    log_warn "Failed to delete leftover Budget: $bname"
-                    add_failed_cleanup "budget"
-                else
-                    if [ "${TASK_BUDGET_NAME:-}" = "$bname" ]; then
-                        TASK_BUDGET_NAME=""
+                if [ -n "$scope_run_id" ]; then
+                    local btags
+                    local barn="arn:aws:budgets::${ACCOUNT_ID}:budget/${bname}"
+                    btags=$(aws budgets list-tags-for-resource --resource-arn "$barn" --output json 2>/dev/null || true)
+                    local has_tag=false
+                    if [ -n "$btags" ]; then
+                        if echo "$btags" | grep -q "\"Key\": *\"freetier-run-id\", *\"Value\": *\"$scope_run_id\""; then
+                            has_tag=true
+                        fi
                     fi
-                    log_success "Destroyed leftover Budget: $bname"
+                    [ "$has_tag" = false ] && continue
+                fi
+                found_count=$((found_count + 1))
+                if [ "$is_dry_run" = "true" ]; then
+                    log_info "[DRY RUN] Found leftover Budget: $bname"
+                else
+                    log_info "Sweeping leftover Budget: $bname..."
+                    if ! aws budgets delete-budget --account-id "$ACCOUNT_ID" --budget-name "$bname" >/dev/null 2>&1; then
+                        log_warn "Failed to delete leftover Budget: $bname"
+                        add_failed_cleanup "budget"
+                    else
+                        if [ "${TASK_BUDGET_NAME:-}" = "$bname" ]; then
+                            TASK_BUDGET_NAME=""
+                        fi
+                        log_success "Destroyed leftover Budget: $bname"
+                    fi
                 fi
             done
+        fi
+    fi
+
+    if [ "$is_dry_run" = "true" ]; then
+        if [ "$found_count" -eq 0 ]; then
+            log_success "No leftover freetier resources found."
+        else
+            log_warn "\nDry run complete: Found $found_count leftover resource(s)."
+            log_warn "To delete these resources, re-run with --confirm or --yes."
         fi
     fi
 }
@@ -486,8 +616,8 @@ cleanup_resources() {
         fi
     done
 
-    # Sweep leftover freetier resources across instance, function, role, db, budget
-    sweep_leftovers
+    # Sweep leftover freetier resources created during THIS run
+    sweep_leftovers "$RUN_ID" false
 
     # Residual temp files from plugins
     rm -f trust-policy.json main.py lambda.zip config.txt profiles.txt
@@ -531,12 +661,22 @@ trap handle_interrupt INT TERM
 trap handle_exit EXIT
 
 if [ "$DO_SWEEP" = true ]; then
-    log_info "\nRunning standalone sweep for leftover freetier resources..."
-    sweep_leftovers
     CLEANUP_PERFORMED=true
     trap - INT TERM EXIT
-    log_success "\nLeftover sweep completed successfully!"
-    exit 0
+    if [ "$CONFIRM_SWEEP" = true ]; then
+        log_info "\nRunning standalone sweep for leftover freetier resources (confirmed)..."
+        sweep_leftovers "" false
+        if [ ${#FAILED_CLEANUPS[@]} -gt 0 ]; then
+            log_error "\nLeftover sweep encountered errors deleting resources: ${FAILED_CLEANUPS[*]}"
+            exit 1
+        fi
+        log_success "\nLeftover sweep completed successfully!"
+        exit 0
+    else
+        log_info "\nRunning standalone sweep dry run for leftover freetier resources..."
+        sweep_leftovers "" true
+        exit 0
+    fi
 fi
 
 # --- PROVISIONING ---

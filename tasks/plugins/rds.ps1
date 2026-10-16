@@ -7,6 +7,7 @@ function Invoke-TaskRdsCheck {
 function Invoke-TaskRdsProvision {
     Write-Host "Creating RDS Database (db.t3.micro MySQL)..."
     $dbName = "freetier-db-$(Get-Random)"
+    $runId = if ($script:RunId) { $script:RunId } elseif ($env:RUN_ID) { $env:RUN_ID } else { "run-$(Get-Random)" }
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["RDSId"] = $dbName
     }
@@ -19,6 +20,7 @@ function Invoke-TaskRdsProvision {
         --master-username admin `
         --master-user-password "FreeTierPassword123!" `
         --no-publicly-accessible `
+        --tags "Key=freetier-run-id,Value=$runId" `
         --skip-final-snapshot | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create RDS Database: $dbName" -ForegroundColor Red
@@ -35,7 +37,13 @@ function Invoke-TaskRdsCleanup {
     param([hashtable]$State)
     if ($State -and $State.RDSId) {
         Write-Host "Deleting RDS Database: $($State.RDSId)..."
-        aws rds delete-db-instance --db-instance-identifier $State.RDSId --skip-final-snapshot | Out-Null
+        $skipSnap = ($script:SkipFinalSnapshot -or ($env:SKIP_FINAL_SNAPSHOT -eq "true"))
+        if ($skipSnap) {
+            aws rds delete-db-instance --db-instance-identifier $State.RDSId --skip-final-snapshot | Out-Null
+        } else {
+            $snapId = "$($State.RDSId)-final-snapshot"
+            aws rds delete-db-instance --db-instance-identifier $State.RDSId --final-db-snapshot-identifier $snapId | Out-Null
+        }
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Failed to delete RDS database: $($State.RDSId)" -ForegroundColor Red
             throw "Failed to delete RDS database: $($State.RDSId)"

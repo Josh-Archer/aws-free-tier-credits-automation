@@ -8,9 +8,10 @@ task_budget_check_perm() {
 
 task_budget_provision() {
     log_info "Creating AWS Budget..."
+    local run_id="${RUN_ID:-run-$RANDOM}"
     TASK_BUDGET_NAME="freetier-budget-$RANDOM"
     local budget_def="{\"BudgetName\":\"$TASK_BUDGET_NAME\",\"BudgetLimit\":{\"Amount\":\"10\",\"Unit\":\"USD\"},\"TimeUnit\":\"MONTHLY\",\"BudgetType\":\"COST\"}"
-    if ! aws budgets create-budget --account-id "$ACCOUNT_ID" --budget "$budget_def" --notifications-with-subscribers "[]" >/dev/null; then
+    if ! aws budgets create-budget --account-id "$ACCOUNT_ID" --budget "$budget_def" --notifications-with-subscribers "[]" --resource-tags "Key=freetier-run-id,Value=$run_id" >/dev/null; then
         log_error "Failed to create Budget: $TASK_BUDGET_NAME"
         TASK_BUDGET_NAME=""
         return 1

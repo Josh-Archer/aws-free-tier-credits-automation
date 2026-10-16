@@ -9,6 +9,7 @@ function Invoke-TaskLambdaProvision {
     Write-Host "Creating Lambda Role and Function..."
     $roleName = "freetier-role-$(Get-Random)"
     $funcName = "freetier-func-$(Get-Random)"
+    $runId = if ($script:RunId) { $script:RunId } elseif ($env:RUN_ID) { $env:RUN_ID } else { "run-$(Get-Random)" }
 
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["LambdaRoleName"] = $roleName
@@ -16,7 +17,7 @@ function Invoke-TaskLambdaProvision {
 
     $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
     $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
-    aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
+    aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json --tags "Key=freetier-run-id,Value=$runId" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Remove-Item -ErrorAction SilentlyContinue trust-policy.json
         if ($null -ne $script:CurrentTaskState) {
@@ -43,6 +44,7 @@ function Invoke-TaskLambdaProvision {
         --runtime python3.12 `
         --role "arn:aws:iam::${account}:role/$roleName" `
         --handler main.lambda_handler `
+        --tags "freetier-run-id=$runId" `
         --zip-file fileb://lambda.zip | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create Lambda function: $funcName" -ForegroundColor Red
@@ -58,6 +60,48 @@ function Invoke-TaskLambdaProvision {
 
     Write-Host "Created Lambda: $funcName" -ForegroundColor Green
     return @{ LambdaRoleName = $roleName; LambdaName = $funcName }
+}
+
+function Remove-TaskIamRole {
+    param([string]$RoleName)
+    if (-not $RoleName) { return }
+
+    # 1. Detach attached policies
+    try {
+        $attachedRaw = aws iam list-attached-role-policies --role-name $RoleName --output json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $attachedRaw) {
+            $attachedData = $attachedRaw | ConvertFrom-Json
+            if ($attachedData -and $attachedData.AttachedPolicies) {
+                foreach ($pol in $attachedData.AttachedPolicies) {
+                    if ($pol.PolicyArn) {
+                        Write-Host "Detaching policy $($pol.PolicyArn) from role $RoleName..." -ForegroundColor Cyan
+                        aws iam detach-role-policy --role-name $RoleName --policy-arn $pol.PolicyArn 2>$null | Out-Null
+                    }
+                }
+            }
+        }
+    } catch {
+    }
+
+    # 2. Delete inline policies
+    try {
+        $inlineRaw = aws iam list-role-policies --role-name $RoleName --output json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $inlineRaw) {
+            $inlineData = $inlineRaw | ConvertFrom-Json
+            if ($inlineData -and $inlineData.PolicyNames) {
+                foreach ($pName in $inlineData.PolicyNames) {
+                    if ($pName) {
+                        Write-Host "Deleting inline policy $pName from role $RoleName..." -ForegroundColor Cyan
+                        aws iam delete-role-policy --role-name $RoleName --policy-name $pName 2>$null | Out-Null
+                    }
+                }
+            }
+        }
+    } catch {
+    }
+
+    # 3. Delete role
+    aws iam delete-role --role-name $RoleName 2>$null | Out-Null
 }
 
 function Invoke-TaskLambdaCleanup {
@@ -87,7 +131,7 @@ function Invoke-TaskLambdaCleanup {
     }
     if ($State -and $State.LambdaRoleName) {
         Write-Host "Deleting IAM Role: $($State.LambdaRoleName)..."
-        aws iam delete-role --role-name $State.LambdaRoleName 2>$null | Out-Null
+        Remove-TaskIamRole -RoleName $State.LambdaRoleName
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Failed to delete IAM role: $($State.LambdaRoleName)" -ForegroundColor Red
             $failed = $true

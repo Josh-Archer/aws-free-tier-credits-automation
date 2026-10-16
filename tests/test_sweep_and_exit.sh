@@ -68,6 +68,10 @@ JSON
                 exit 0
                 ;;
             terminate-instances)
+                if [ "${FAIL_EC2_TERMINATE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling TerminateInstances" >&2
+                    exit 1
+                fi
                 echo '{"TerminatingInstances": []}'
                 exit 0
                 ;;
@@ -100,6 +104,10 @@ JSON
                 exit 0
                 ;;
             delete-db-instance)
+                if [ "${FAIL_RDS_DELETE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling DeleteDBInstance" >&2
+                    exit 1
+                fi
                 exit 0
                 ;;
         esac
@@ -129,6 +137,14 @@ JSON
                 exit 0
                 ;;
             delete-budget)
+                if [ "${FAIL_BUDGETS_DELETE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling DeleteBudget" >&2
+                    exit 1
+                fi
+                exit 0
+                ;;
+            list-tags-for-resource)
+                echo '{"ResourceTags": []}'
                 exit 0
                 ;;
         esac
@@ -157,7 +173,25 @@ JSON
             create-role)
                 exit 0
                 ;;
+            list-attached-role-policies)
+                echo '{"AttachedPolicies": []}'
+                exit 0
+                ;;
+            detach-role-policy)
+                exit 0
+                ;;
+            list-role-policies)
+                echo '{"PolicyNames": []}'
+                exit 0
+                ;;
+            delete-role-policy)
+                exit 0
+                ;;
             delete-role)
+                if [ "${FAIL_IAM_DELETE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling DeleteRole" >&2
+                    exit 1
+                fi
                 exit 0
                 ;;
         esac
@@ -190,7 +224,15 @@ JSON
                 fi
                 exit 0
                 ;;
+            list-tags)
+                echo '{"Tags": {}}'
+                exit 0
+                ;;
             delete-function)
+                if [ "${FAIL_LAMBDA_DELETE:-0}" = "1" ]; then
+                    echo "An error occurred (AccessDenied) when calling DeleteFunction" >&2
+                    exit 1
+                fi
                 exit 0
                 ;;
         esac
@@ -204,10 +246,10 @@ chmod +x "${FAKE_BIN_DIR}/aws"
 export PATH="${FAKE_BIN_DIR}:${PATH}"
 export AWS_LOG
 
-# Test 1: Standalone --sweep terminates leftover freetier resources and ignores non-freetier resources
-echo "=== Test 1: Standalone --sweep sweeps all leftover freetier resources ==="
+# Test 1: Standalone --sweep defaults to dry run (list only, no deletes)
+echo "=== Test 1: Standalone --sweep defaults to dry run ==="
 : > "$AWS_LOG"
-LOG_OUT="${TEST_TMP}/sweep_standalone.log"
+LOG_OUT="${TEST_TMP}/sweep_dry_run.log"
 
 EC2_HAS_LEFTOVERS=1 \
 RDS_HAS_LEFTOVERS=1 \
@@ -215,6 +257,78 @@ LAMBDA_HAS_LEFTOVERS=1 \
 IAM_HAS_LEFTOVERS=1 \
 BUDGETS_HAS_LEFTOVERS=1 \
 bash "${REPO_DIR}/run_and_cleanup.sh" --sweep > "$LOG_OUT" 2>&1
+
+grep -q "\[DRY RUN\] Found leftover EC2 Instance: i-LEFTOVER_EC2" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run EC2 listing"
+    cat "$LOG_OUT"
+    exit 1
+}
+grep -q "\[DRY RUN\] Found leftover RDS Database: freetier-db-9999" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run RDS listing"
+    cat "$LOG_OUT"
+    exit 1
+}
+grep -q "\[DRY RUN\] Found leftover Lambda Function: freetier-func-3333" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run Lambda listing"
+    cat "$LOG_OUT"
+    exit 1
+}
+grep -q "\[DRY RUN\] Found leftover IAM Role: freetier-role-5555" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run IAM role listing"
+    cat "$LOG_OUT"
+    exit 1
+}
+grep -q "\[DRY RUN\] Found leftover Budget: freetier-budget-7777" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run Budget listing"
+    cat "$LOG_OUT"
+    exit 1
+}
+grep -q "To delete these resources, re-run with --confirm or --yes" "$LOG_OUT" || {
+    echo "FAIL: Expected dry run confirmation instruction"
+    cat "$LOG_OUT"
+    exit 1
+}
+
+# Ensure NO delete commands were executed in dry run
+if grep -q "terminate-instances" "$AWS_LOG"; then
+    echo "FAIL: terminate-instances was executed during dry run"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-db-instance" "$AWS_LOG"; then
+    echo "FAIL: delete-db-instance was executed during dry run"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-function" "$AWS_LOG"; then
+    echo "FAIL: delete-function was executed during dry run"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-role" "$AWS_LOG"; then
+    echo "FAIL: delete-role was executed during dry run"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-budget" "$AWS_LOG"; then
+    echo "FAIL: delete-budget was executed during dry run"
+    cat "$AWS_LOG"
+    exit 1
+fi
+
+echo "PASS: Standalone --sweep defaulted to dry-run listing without deleting any resources."
+
+# Test 2: Standalone --sweep --confirm deletes all leftover freetier resources (with snapshot by default)
+echo "=== Test 2: Standalone --sweep --confirm sweeps freetier resources with RDS snapshot ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/sweep_confirmed.log"
+
+EC2_HAS_LEFTOVERS=1 \
+RDS_HAS_LEFTOVERS=1 \
+LAMBDA_HAS_LEFTOVERS=1 \
+IAM_HAS_LEFTOVERS=1 \
+BUDGETS_HAS_LEFTOVERS=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --sweep --confirm > "$LOG_OUT" 2>&1
 
 grep -q "Leftover sweep completed successfully!" "$LOG_OUT" || {
     echo "FAIL: Expected successful sweep completion message"
@@ -234,9 +348,9 @@ if grep -q "i-PROD_SERVER" "$AWS_LOG"; then
     exit 1
 fi
 
-# Verify RDS sweep: deletes freetier-db, ignores prod db
-grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999" "$AWS_LOG" || {
-    echo "FAIL: Expected rds delete-db-instance for freetier-db-9999"
+# Verify RDS sweep: deletes freetier-db with final snapshot by default, ignores prod db
+grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999 --final-db-snapshot-identifier freetier-db-9999-final-snapshot" "$AWS_LOG" || {
+    echo "FAIL: Expected rds delete-db-instance with --final-db-snapshot-identifier for freetier-db-9999"
     cat "$AWS_LOG"
     exit 1
 }
@@ -282,12 +396,58 @@ if grep -q "prod-monthly-cap" "$AWS_LOG"; then
     exit 1
 fi
 
-echo "PASS: Standalone --sweep successfully cleaned up all leftover freetier resources without touching non-freetier resources."
+echo "PASS: Standalone --sweep --confirm cleaned up leftover resources with RDS final snapshot."
 
-# Test 2: Failed run sweeps leftover resources on runner exit
-echo "=== Test 2: Failed run sweeps leftover resources upon exit ==="
+# Test 3: Standalone --sweep --yes --skip-final-snapshot skips RDS final snapshot
+echo "=== Test 3: Standalone --sweep with --skip-final-snapshot skips snapshot ==="
 : > "$AWS_LOG"
-LOG_OUT="${TEST_TMP}/sweep_failed_run.log"
+LOG_OUT="${TEST_TMP}/sweep_skip_snapshot.log"
+
+RDS_HAS_LEFTOVERS=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --sweep --yes --skip-final-snapshot > "$LOG_OUT" 2>&1
+
+grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999 --skip-final-snapshot" "$AWS_LOG" || {
+    echo "FAIL: Expected rds delete-db-instance with --skip-final-snapshot"
+    cat "$AWS_LOG"
+    exit 1
+}
+if grep -q "final-db-snapshot-identifier" "$AWS_LOG"; then
+    echo "FAIL: Unexpected --final-db-snapshot-identifier when --skip-final-snapshot was specified"
+    cat "$AWS_LOG"
+    exit 1
+fi
+
+echo "PASS: Standalone sweep skipped RDS snapshot when --skip-final-snapshot was passed."
+
+# Test 4: Standalone sweep exits non-zero when any delete fails
+echo "=== Test 4: Standalone sweep exits non-zero when delete fails ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/sweep_fail.log"
+
+set +e
+EC2_HAS_LEFTOVERS=1 \
+FAIL_EC2_TERMINATE=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --sweep --confirm > "$LOG_OUT" 2>&1
+EXIT_CODE=$?
+set -e
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+    echo "FAIL: Expected non-zero exit code when sweep delete fails"
+    cat "$LOG_OUT"
+    exit 1
+fi
+grep -q "Leftover sweep encountered errors deleting resources" "$LOG_OUT" || {
+    echo "FAIL: Expected sweep failure message in output"
+    cat "$LOG_OUT"
+    exit 1
+}
+
+echo "PASS: Standalone sweep exited non-zero when delete failed."
+
+# Test 5: Normal run cleanup touches only THIS run's resources (scoped by run id tag)
+echo "=== Test 5: Normal run cleanup touches only this run's resources ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/normal_run_scoped_cleanup.log"
 
 set +e
 FAIL_LAMBDA_CREATE=1 \
@@ -306,26 +466,67 @@ if [ "$EXIT_CODE" -eq 0 ]; then
     exit 1
 fi
 
-# The failed run should have invoked the shared cleanup path, sweeping leftovers
-grep -q "ec2 terminate-instances --instance-ids i-LEFTOVER_EC2" "$AWS_LOG" || {
-    echo "FAIL: Expected leftover EC2 instance to be swept after failed run"
+# The failed run must clean up its own IAM role
+grep -q "iam delete-role --role-name" "$AWS_LOG" || {
+    echo "FAIL: Expected this run's IAM role to be deleted"
     cat "$AWS_LOG"
     exit 1
 }
-grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999" "$AWS_LOG" || {
-    echo "FAIL: Expected leftover RDS database to be swept after failed run"
-    cat "$AWS_LOG"
-    exit 1
-}
-grep -q "budgets delete-budget --account-id 123456789012 --budget-name freetier-budget-7777" "$AWS_LOG" || {
-    echo "FAIL: Expected leftover Budget to be swept after failed run"
-    cat "$AWS_LOG"
-    exit 1
-}
-echo "PASS: Failed run swept leftover freetier resources upon exit."
 
-# Test 3: EXIT trap during wait cleans up provisioned resources
-echo "=== Test 3: Runner exit during wait triggers EXIT trap cleanup ==="
+# The failed run must NEVER delete leftover resources from other runs!
+if grep -q "terminate-instances" "$AWS_LOG"; then
+    echo "FAIL: Normal run terminated other run's EC2 instance!"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-db-instance" "$AWS_LOG"; then
+    echo "FAIL: Normal run deleted other run's RDS database freetier-db-9999!"
+    cat "$AWS_LOG"
+    exit 1
+fi
+if grep -q "delete-budget" "$AWS_LOG"; then
+    echo "FAIL: Normal run deleted other run's Budget freetier-budget-7777!"
+    cat "$AWS_LOG"
+    exit 1
+fi
+
+echo "PASS: Normal run cleanup touched only this run's resources, never all freetier-* in account."
+
+# Test 6: Normal run RDS deletion takes final snapshot by default and skips with --skip-final-snapshot
+echo "=== Test 6: Normal run RDS deletion snapshot behavior ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/normal_rds_default_snap.log"
+
+WAIT_SECONDS=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --only rds > "$LOG_OUT" 2>&1
+
+grep -q "rds delete-db-instance --db-instance-identifier freetier-db-[0-9]* --final-db-snapshot-identifier freetier-db-[0-9]*-final-snapshot" "$AWS_LOG" || {
+    echo "FAIL: Expected normal run RDS delete to take final snapshot by default"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/normal_rds_skip_snap.log"
+
+WAIT_SECONDS=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --only rds --skip-final-snapshot > "$LOG_OUT" 2>&1
+
+grep -q "rds delete-db-instance --db-instance-identifier freetier-db-[0-9]* --skip-final-snapshot" "$AWS_LOG" || {
+    echo "FAIL: Expected normal run RDS delete to skip final snapshot when --skip-final-snapshot is passed"
+    cat "$AWS_LOG"
+    exit 1
+}
+if grep -q "final-db-snapshot-identifier" "$AWS_LOG"; then
+    echo "FAIL: Unexpected final snapshot identifier when --skip-final-snapshot was passed"
+    cat "$AWS_LOG"
+    exit 1
+fi
+
+echo "PASS: Normal run RDS deletion takes final snapshot by default and skips with --skip-final-snapshot."
+
+# Test 7: Runner exit during wait triggers EXIT trap cleanup
+echo "=== Test 7: Runner exit during wait triggers EXIT trap cleanup ==="
 : > "$AWS_LOG"
 LOG_OUT="${TEST_TMP}/exit_trap_wait.log"
 
@@ -374,18 +575,32 @@ grep -q "budgets delete-budget" "$AWS_LOG" || {
 }
 echo "PASS: Runner exit during wait triggered EXIT trap cleanup."
 
-# Test 4: PowerShell runner tests (if pwsh available)
+# Test 8: PowerShell runner tests (if pwsh available)
 if command -v pwsh >/dev/null 2>&1; then
-    echo "=== Test 4: PowerShell runner - -Sweep flag ==="
+    echo "=== Test 8: PowerShell runner - -Sweep dry run and confirmed ==="
     : > "$AWS_LOG"
-    LOG_OUT="${TEST_TMP}/pwsh_sweep.log"
+    LOG_OUT="${TEST_TMP}/pwsh_sweep_dry.log"
 
     EC2_HAS_LEFTOVERS=1 \
     RDS_HAS_LEFTOVERS=1 \
-    LAMBDA_HAS_LEFTOVERS=1 \
-    IAM_HAS_LEFTOVERS=1 \
-    BUDGETS_HAS_LEFTOVERS=1 \
     pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Sweep > "$LOG_OUT" 2>&1
+
+    grep -q "\[DRY RUN\] Found leftover EC2 Instance: i-LEFTOVER_EC2" "$LOG_OUT" || {
+        echo "FAIL: Expected pwsh dry run EC2 listing"
+        cat "$LOG_OUT"
+        exit 1
+    }
+    if grep -q "terminate-instances" "$AWS_LOG"; then
+        echo "FAIL: pwsh executed terminate-instances during dry run"
+        cat "$AWS_LOG"
+        exit 1
+    fi
+
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_sweep_confirm.log"
+    EC2_HAS_LEFTOVERS=1 \
+    RDS_HAS_LEFTOVERS=1 \
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Sweep -Confirm > "$LOG_OUT" 2>&1
 
     grep -q "Leftover sweep completed successfully!" "$LOG_OUT" || {
         echo "FAIL: Expected pwsh sweep completion message"
@@ -397,12 +612,28 @@ if command -v pwsh >/dev/null 2>&1; then
         cat "$AWS_LOG"
         exit 1
     }
-    grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999" "$AWS_LOG" || {
-        echo "FAIL: Expected pwsh rds delete-db-instance for freetier-db-9999"
+    grep -q "rds delete-db-instance --db-instance-identifier freetier-db-9999 --final-db-snapshot-identifier freetier-db-9999-final-snapshot" "$AWS_LOG" || {
+        echo "FAIL: Expected pwsh rds delete-db-instance with snapshot"
         cat "$AWS_LOG"
         exit 1
     }
-    echo "PASS: PowerShell runner -Sweep flag passed."
+
+    # pwsh sweep with failure exits nonzero
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_sweep_fail.log"
+    set +e
+    EC2_HAS_LEFTOVERS=1 \
+    FAIL_EC2_TERMINATE=1 \
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Sweep -Confirm > "$LOG_OUT" 2>&1
+    PWSH_EC=$?
+    set -e
+    if [ "$PWSH_EC" -eq 0 ]; then
+        echo "FAIL: Expected pwsh -Sweep -Confirm to exit non-zero on delete failure"
+        cat "$LOG_OUT"
+        exit 1
+    fi
+
+    echo "PASS: PowerShell runner sweep tests passed."
 fi
 
 echo "All sweep and exit cleanup tests passed successfully!"

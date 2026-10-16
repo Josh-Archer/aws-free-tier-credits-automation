@@ -21,10 +21,11 @@ task_ec2_provision() {
     fi
 
     log_info "Launching EC2 instance (t2.micro) with AMI $ami..."
+    local run_id="${RUN_ID:-run-$RANDOM}"
     local instance_name="freetier-ec2-$RANDOM"
     local instance_id
     if ! instance_id=$(aws ec2 run-instances --image-id "$ami" --instance-type t2.micro \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$instance_name}]" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$instance_name},{Key=freetier-run-id,Value=$run_id}]" \
         --query "Instances[0].InstanceId" --output text); then
         log_error "Failed to launch EC2 instance."
         TASK_EC2_INSTANCE_ID=""

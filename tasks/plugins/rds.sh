@@ -7,6 +7,7 @@ task_rds_check_perm() {
 
 task_rds_provision() {
     log_info "Creating RDS Database (db.t3.micro MySQL)..."
+    local run_id="${RUN_ID:-run-$RANDOM}"
     TASK_RDS_ID="freetier-db-$RANDOM"
     if ! aws rds create-db-instance \
         --db-instance-identifier "$TASK_RDS_ID" \
@@ -17,6 +18,7 @@ task_rds_provision() {
         --master-username admin \
         --master-user-password "FreeTierPassword123!" \
         --no-publicly-accessible \
+        --tags "Key=freetier-run-id,Value=$run_id" \
         --skip-final-snapshot >/dev/null; then
         log_error "Failed to create RDS Database: $TASK_RDS_ID"
         TASK_RDS_ID=""
@@ -28,7 +30,13 @@ task_rds_provision() {
 task_rds_cleanup() {
     if [ -n "${TASK_RDS_ID:-}" ]; then
         log_info "Deleting RDS Database: $TASK_RDS_ID..."
-        if ! aws rds delete-db-instance --db-instance-identifier "$TASK_RDS_ID" --skip-final-snapshot >/dev/null; then
+        local -a snap_args
+        if [ "${SKIP_FINAL_SNAPSHOT:-false}" = "true" ]; then
+            snap_args=(--skip-final-snapshot)
+        else
+            snap_args=(--final-db-snapshot-identifier "${TASK_RDS_ID}-final-snapshot")
+        fi
+        if ! aws rds delete-db-instance --db-instance-identifier "$TASK_RDS_ID" "${snap_args[@]}" >/dev/null; then
             log_error "Failed to delete RDS Database: $TASK_RDS_ID"
             return 1
         fi
