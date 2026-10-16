@@ -26,8 +26,32 @@ case "$cmd" in
             exit 0
         fi
         ;;
+    ec2)
+        case "$sub" in
+            describe-regions)
+                echo '{"Regions": []}'
+                exit 0
+                ;;
+            describe-instances)
+                echo '{"Reservations": []}'
+                exit 0
+                ;;
+        esac
+        ;;
+    rds)
+        case "$sub" in
+            describe-db-instances)
+                echo '{"DBInstances": []}'
+                exit 0
+                ;;
+        esac
+        ;;
     iam)
         case "$sub" in
+            list-roles)
+                echo '{"Roles": []}'
+                exit 0
+                ;;
             create-role)
                 if [ "${FAIL_IAM_ROLE_CREATE:-0}" = "1" ]; then
                     echo "An error occurred (AccessDenied) when calling the CreateRole operation" >&2
@@ -79,6 +103,10 @@ case "$cmd" in
                 fi
                 exit 0
                 ;;
+            list-tags)
+                echo '{"Tags": {}}'
+                exit 0
+                ;;
             delete-function)
                 if [ "${FAIL_LAMBDA_DELETE:-0}" = "1" ]; then
                     echo "An error occurred (AccessDeniedException) when calling the DeleteFunction operation" >&2
@@ -88,6 +116,18 @@ case "$cmd" in
                     echo "An error occurred (ResourceNotFoundException) when calling the DeleteFunction operation: Function not found" >&2
                     exit 1
                 fi
+                exit 0
+                ;;
+        esac
+        ;;
+    budgets)
+        case "$sub" in
+            describe-budgets)
+                echo '{"Budgets": []}'
+                exit 0
+                ;;
+            list-tags-for-resource)
+                echo '{"ResourceTags": []}'
                 exit 0
                 ;;
         esac

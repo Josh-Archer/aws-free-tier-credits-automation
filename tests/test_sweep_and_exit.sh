@@ -689,4 +689,47 @@ if command -v pwsh >/dev/null 2>&1; then
     echo "PASS: PowerShell runner sweep tests passed."
 fi
 
+# Test 9: Accounts with zero budgets succeed in sweep and normal run
+echo "=== Test 9: Accounts with zero budgets succeed in sweep and normal run ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/sweep_no_budgets_bash.log"
+
+bash "${REPO_DIR}/run_and_cleanup.sh" --sweep --confirm > "$LOG_OUT" 2>&1
+grep -q "Leftover sweep completed successfully!" "$LOG_OUT" || {
+    echo "FAIL: Expected successful sweep completion for account with no budgets (bash)"
+    cat "$LOG_OUT"
+    exit 1
+}
+
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/normal_no_budgets_bash.log"
+WAIT_SECONDS=0 bash "${REPO_DIR}/run_and_cleanup.sh" --only budget > "$LOG_OUT" 2>&1
+grep -q "Automation Finished Successfully!" "$LOG_OUT" || {
+    echo "FAIL: Expected successful normal run for account with no budgets (bash)"
+    cat "$LOG_OUT"
+    exit 1
+}
+
+if command -v pwsh >/dev/null 2>&1; then
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/sweep_no_budgets_pwsh.log"
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Sweep -Confirm > "$LOG_OUT" 2>&1
+    grep -q "Leftover sweep completed successfully!" "$LOG_OUT" || {
+        echo "FAIL: Expected successful sweep completion for account with no budgets (pwsh)"
+        cat "$LOG_OUT"
+        exit 1
+    }
+
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/normal_no_budgets_pwsh.log"
+    WAIT_SECONDS=0 pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Only budget > "$LOG_OUT" 2>&1
+    grep -q "Automation Finished Successfully!" "$LOG_OUT" || {
+        echo "FAIL: Expected successful normal run for account with no budgets (pwsh)"
+        cat "$LOG_OUT"
+        exit 1
+    }
+fi
+
+echo "PASS: Account with zero budgets succeeded in sweep and normal run."
+
 echo "All sweep and exit cleanup tests passed successfully!"

@@ -40,6 +40,10 @@ case "\$cmd" in
                 echo "i-REDACTED_TEST_EC2"
                 exit 0
                 ;;
+            describe-instances)
+                echo '{"Reservations": []}'
+                exit 0
+                ;;
             terminate-instances)
                 echo '{"TerminatingInstances": []}'
                 exit 0
@@ -72,11 +76,33 @@ case "\$cmd" in
             delete-budget)
                 exit 0
                 ;;
+            list-tags-for-resource)
+                echo '{"ResourceTags": []}'
+                exit 0
+                ;;
         esac
         ;;
     iam)
         case "\$sub" in
+            list-roles)
+                echo '{"Roles": []}'
+                exit 0
+                ;;
             create-role)
+                exit 0
+                ;;
+            list-attached-role-policies)
+                echo '{"AttachedPolicies": []}'
+                exit 0
+                ;;
+            detach-role-policy)
+                exit 0
+                ;;
+            list-role-policies)
+                echo '{"PolicyNames": []}'
+                exit 0
+                ;;
+            delete-role-policy)
                 exit 0
                 ;;
             delete-role)
@@ -95,6 +121,10 @@ case "\$cmd" in
                     touch "\${CREATE_FUNCTION_SIGNAL_FILE}"
                     sleep 5
                 fi
+                exit 0
+                ;;
+            list-tags)
+                echo '{"Tags": {}}'
                 exit 0
                 ;;
             delete-function)

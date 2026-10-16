@@ -517,9 +517,9 @@ function Invoke-SweepLeftovers {
                             }
                         }
                     }
-                } else {
-                    $script:SweepErrors.Add("budget: describe-budgets") | Out-Null
                 }
+            } else {
+                $script:SweepErrors.Add("budget: describe-budgets") | Out-Null
             }
         } catch {
             Write-Host "Error sweeping Budgets: $($_.Exception.Message)" -ForegroundColor Yellow
