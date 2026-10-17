@@ -10,17 +10,29 @@ function Invoke-TaskLambdaProvision {
     $roleName = "freetier-role-$(Get-Random)"
     $funcName = "freetier-func-$(Get-Random)"
 
+    $tmpDir = if (Get-Command mktemp -ErrorAction SilentlyContinue) {
+        (mktemp -d).Trim()
+    } else {
+        $p = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Force -Path $p | Out-Null
+        $p
+    }
+
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["LambdaRoleName"] = $roleName
+        $script:CurrentTaskState["LambdaTmpDir"] = $tmpDir
     }
 
     $trustPolicy = '{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
-    $trustPolicy | Out-File -FilePath trust-policy.json -Encoding ascii
-    aws iam create-role --role-name $roleName --assume-role-policy-document file://trust-policy.json | Out-Null
+    $trustPolicyFile = Join-Path $tmpDir "trust-policy.json"
+    $trustPolicy | Out-File -FilePath $trustPolicyFile -Encoding ascii
+    $trustPolicyUri = "file://" + ($trustPolicyFile -replace '\\', '/')
+    aws iam create-role --role-name $roleName --assume-role-policy-document $trustPolicyUri | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Remove-Item -ErrorAction SilentlyContinue trust-policy.json
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmpDir
         if ($null -ne $script:CurrentTaskState) {
             $script:CurrentTaskState.Remove("LambdaRoleName")
+            $script:CurrentTaskState.Remove("LambdaTmpDir")
         }
         throw "Failed to create IAM role: $roleName"
     }
@@ -30,20 +42,23 @@ function Invoke-TaskLambdaProvision {
     Start-Sleep -Seconds $roleWait
 
     $lambdaCode = "def lambda_handler(event, context): return 'Hello Free Tier'"
-    $lambdaCode | Out-File -FilePath main.py -Encoding ascii
-    Compress-Archive -Path main.py -DestinationPath lambda.zip -Force
+    $mainFile = Join-Path $tmpDir "main.py"
+    $zipFile = Join-Path $tmpDir "lambda.zip"
+    $lambdaCode | Out-File -FilePath $mainFile -Encoding ascii
+    Compress-Archive -Path $mainFile -DestinationPath $zipFile -Force
 
     $account = $script:TaskAccountId
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["LambdaName"] = $funcName
     }
 
+    $zipFileUri = "fileb://" + ($zipFile -replace '\\', '/')
     aws lambda create-function `
         --function-name $funcName `
         --runtime python3.12 `
         --role "arn:aws:iam::${account}:role/$roleName" `
         --handler main.lambda_handler `
-        --zip-file fileb://lambda.zip | Out-Null
+        --zip-file $zipFileUri | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create Lambda function: $funcName" -ForegroundColor Red
         if ($null -ne $script:CurrentTaskState) {
@@ -57,7 +72,7 @@ function Invoke-TaskLambdaProvision {
     }
 
     Write-Host "Created Lambda: $funcName" -ForegroundColor Green
-    return @{ LambdaRoleName = $roleName; LambdaName = $funcName }
+    return @{ LambdaRoleName = $roleName; LambdaName = $funcName; LambdaTmpDir = $tmpDir }
 }
 
 function Invoke-TaskLambdaCleanup {
@@ -96,6 +111,22 @@ function Invoke-TaskLambdaCleanup {
             $State.Remove("LambdaRoleName")
             $cleaned = $true
         }
+    }
+    $tmpDirToDelete = if ($State -and $State.LambdaTmpDir) {
+        $State.LambdaTmpDir
+    } elseif ($script:CurrentTaskState -and $script:CurrentTaskState.LambdaTmpDir) {
+        $script:CurrentTaskState.LambdaTmpDir
+    } else {
+        $null
+    }
+    if ($tmpDirToDelete -and (Test-Path $tmpDirToDelete)) {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmpDirToDelete
+    }
+    if ($State -and $State.LambdaTmpDir) {
+        $State.Remove("LambdaTmpDir")
+    }
+    if ($null -ne $script:CurrentTaskState -and $script:CurrentTaskState.ContainsKey("LambdaTmpDir")) {
+        $script:CurrentTaskState.Remove("LambdaTmpDir")
     }
     Remove-Item -ErrorAction SilentlyContinue trust-policy.json, main.py, lambda.zip
     if ($failed) {

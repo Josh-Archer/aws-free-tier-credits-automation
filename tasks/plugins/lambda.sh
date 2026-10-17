@@ -11,20 +11,23 @@ task_lambda_provision() {
     TASK_LAMBDA_ROLE="freetier-role-$RANDOM"
     local func_name="freetier-func-$RANDOM"
 
+    TASK_LAMBDA_TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t 'lambda')"
+
     local trust_policy='{"Version": "2012-10-17","Statement": [{"Action": "sts:AssumeRole","Principal": {"Service": "lambda.amazonaws.com"},"Effect": "Allow"}]}'
-    echo "$trust_policy" > trust-policy.json
-    if ! aws iam create-role --role-name "$TASK_LAMBDA_ROLE" --assume-role-policy-document file://trust-policy.json >/dev/null; then
+    echo "$trust_policy" > "${TASK_LAMBDA_TMP_DIR}/trust-policy.json"
+    if ! aws iam create-role --role-name "$TASK_LAMBDA_ROLE" --assume-role-policy-document "file://${TASK_LAMBDA_TMP_DIR}/trust-policy.json" >/dev/null; then
         log_error "Failed to create IAM role: $TASK_LAMBDA_ROLE"
         TASK_LAMBDA_ROLE=""
-        rm -f trust-policy.json
+        rm -rf "$TASK_LAMBDA_TMP_DIR"
+        TASK_LAMBDA_TMP_DIR=""
         return 1
     fi
 
     # Wait for role to propagate
     sleep "${LAMBDA_ROLE_WAIT:-10}"
 
-    echo "def lambda_handler(event, context): return 'Hello Free Tier'" > main.py
-    if ! zip -q lambda.zip main.py; then
+    echo "def lambda_handler(event, context): return 'Hello Free Tier'" > "${TASK_LAMBDA_TMP_DIR}/main.py"
+    if ! (cd "$TASK_LAMBDA_TMP_DIR" && zip -q lambda.zip main.py); then
         log_error "Failed to package lambda code."
         TASK_LAMBDA_NAME=""
         task_lambda_cleanup
@@ -37,7 +40,7 @@ task_lambda_provision() {
         --runtime python3.12 \
         --role "arn:aws:iam::${ACCOUNT_ID}:role/${TASK_LAMBDA_ROLE}" \
         --handler main.lambda_handler \
-        --zip-file fileb://lambda.zip >/dev/null; then
+        --zip-file "fileb://${TASK_LAMBDA_TMP_DIR}/lambda.zip" >/dev/null; then
         TASK_LAMBDA_NAME=""
         log_error "Failed to create Lambda function: $func_name"
         task_lambda_cleanup
@@ -75,6 +78,10 @@ task_lambda_cleanup() {
             TASK_LAMBDA_ROLE=""
             cleaned=true
         fi
+    fi
+    if [ -n "${TASK_LAMBDA_TMP_DIR:-}" ] && [ -d "$TASK_LAMBDA_TMP_DIR" ]; then
+        rm -rf "$TASK_LAMBDA_TMP_DIR"
+        TASK_LAMBDA_TMP_DIR=""
     fi
     rm -f trust-policy.json main.py lambda.zip
     if [ "$failed" = true ]; then
