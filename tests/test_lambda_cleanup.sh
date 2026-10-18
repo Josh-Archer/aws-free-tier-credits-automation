@@ -57,6 +57,16 @@ case "$cmd" in
                     echo "An error occurred (AccessDenied) when calling the CreateRole operation" >&2
                     exit 1
                 fi
+                for arg in "$@"; do
+                    case "$arg" in
+                        file://*)
+                            doc_path="${arg#file://}"
+                            if [ -f "$doc_path" ]; then
+                                echo "CREATE_ROLE_DOC_EXISTS: $doc_path" >> "${AWS_LOG}"
+                            fi
+                            ;;
+                    esac
+                done
                 exit 0
                 ;;
             list-attached-role-policies)
@@ -101,6 +111,22 @@ case "$cmd" in
                     echo "An error occurred (InvalidParameterValueException) when calling the CreateFunction operation" >&2
                     exit 1
                 fi
+                for arg in "$@"; do
+                    case "$arg" in
+                        fileb://*)
+                            zip_path="${arg#fileb://}"
+                            if [ -f "$zip_path" ]; then
+                                echo "CREATE_FUNCTION_ZIP_EXISTS: $zip_path" >> "${AWS_LOG}"
+                                if unzip -l "$zip_path" 2>/dev/null | grep -q "[[:space:]]main.py$"; then
+                                    echo "ZIP_ENTRY_MAIN_OK: $zip_path" >> "${AWS_LOG}"
+                                fi
+                            fi
+                            if [ -f "$(dirname "$zip_path")/main.py" ]; then
+                                echo "CREATE_FUNCTION_MAIN_EXISTS: $(dirname "$zip_path")/main.py" >> "${AWS_LOG}"
+                            fi
+                            ;;
+                    esac
+                done
                 exit 0
                 ;;
             list-tags)
@@ -180,6 +206,16 @@ for f in trust-policy.json main.py lambda.zip; do
     fi
 done
 
+created_policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+if [ -n "$created_policy_doc" ]; then
+    policy_dir="${created_policy_doc#file://}"
+    policy_dir="$(dirname "$policy_dir")"
+    if [ -d "$policy_dir" ]; then
+        echo "FAIL: Expected temp dir ($policy_dir) to be cleaned up after create failure"
+        exit 1
+    fi
+fi
+
 grep -q "Provisioning failed for task: lambda" "$LOG_OUT" || {
     echo "FAIL: Expected provisioning failure message in output"
     cat "$LOG_OUT"
@@ -213,6 +249,63 @@ fi
 
 if [ "$created_role" != "$deleted_role" ]; then
     echo "FAIL: Deleted role ($deleted_role) does not match created role ($created_role)"
+    exit 1
+fi
+
+policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+zip_arg=$(grep "lambda create-function --function-name" "$AWS_LOG" | sed -n 's/.*--zip-file \([^ ]*\).*/\1/p' | head -n1)
+
+if [ "$policy_doc" = "file://trust-policy.json" ]; then
+    echo "FAIL: Expected assume-role-policy-document to point to temp dir, got $policy_doc"
+    exit 1
+fi
+
+if [ "$zip_arg" = "fileb://lambda.zip" ]; then
+    echo "FAIL: Expected zip-file to point to temp dir, got $zip_arg"
+    exit 1
+fi
+
+case "${policy_doc#file://}" in
+    "${REPO_DIR}"/*)
+        echo "FAIL: Policy doc was created inside repo dir: $policy_doc"
+        exit 1
+        ;;
+esac
+
+case "${zip_arg#fileb://}" in
+    "${REPO_DIR}"/*)
+        echo "FAIL: Lambda zip was created inside repo dir: $zip_arg"
+        exit 1
+        ;;
+esac
+
+grep -q "^CREATE_ROLE_DOC_EXISTS:" "$AWS_LOG" || {
+    echo "FAIL: Expected trust-policy.json to exist during create-role"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+grep -q "^CREATE_FUNCTION_ZIP_EXISTS:" "$AWS_LOG" || {
+    echo "FAIL: Expected lambda.zip to exist during create-function"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+grep -q "^CREATE_FUNCTION_MAIN_EXISTS:" "$AWS_LOG" || {
+    echo "FAIL: Expected main.py to exist during create-function"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+grep -q "^ZIP_ENTRY_MAIN_OK:" "$AWS_LOG" || {
+    echo "FAIL: Expected lambda.zip to contain main.py at root"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+policy_dir="$(dirname "${policy_doc#file://}")"
+if [ -d "$policy_dir" ]; then
+    echo "FAIL: Expected temp dir ($policy_dir) to be deleted after cleanup"
     exit 1
 fi
 
@@ -271,6 +364,16 @@ if command -v pwsh >/dev/null 2>&1; then
         fi
     done
 
+    created_policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+    if [ -n "$created_policy_doc" ]; then
+        policy_dir="${created_policy_doc#file://}"
+        policy_dir="$(dirname "$policy_dir")"
+        if [ -d "$policy_dir" ]; then
+            echo "FAIL: Expected temp dir ($policy_dir) to be cleaned up after pwsh create failure"
+            exit 1
+        fi
+    fi
+
     echo "PASS: PowerShell runner cleaned up IAM role when create-function failed."
 
     # Test 4: PowerShell runner - Lambda normal execution provisions and cleans up both
@@ -298,6 +401,63 @@ if command -v pwsh >/dev/null 2>&1; then
 
     if [ "$created_role" != "$deleted_role" ]; then
         echo "FAIL: Deleted role ($deleted_role) does not match created role ($created_role)"
+        exit 1
+    fi
+
+    policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+    zip_arg=$(grep "lambda create-function --function-name" "$AWS_LOG" | sed -n 's/.*--zip-file \([^ ]*\).*/\1/p' | head -n1)
+
+    if [ "$policy_doc" = "file://trust-policy.json" ]; then
+        echo "FAIL: Expected pwsh assume-role-policy-document to point to temp dir, got $policy_doc"
+        exit 1
+    fi
+
+    if [ "$zip_arg" = "fileb://lambda.zip" ]; then
+        echo "FAIL: Expected pwsh zip-file to point to temp dir, got $zip_arg"
+        exit 1
+    fi
+
+    case "${policy_doc#file://}" in
+        "${REPO_DIR}"/*)
+            echo "FAIL: pwsh policy doc was created inside repo dir: $policy_doc"
+            exit 1
+            ;;
+    esac
+
+    case "${zip_arg#fileb://}" in
+        "${REPO_DIR}"/*)
+            echo "FAIL: pwsh lambda zip was created inside repo dir: $zip_arg"
+            exit 1
+            ;;
+    esac
+
+    grep -q "^CREATE_ROLE_DOC_EXISTS:" "$AWS_LOG" || {
+        echo "FAIL: Expected trust-policy.json to exist during pwsh create-role"
+        cat "$AWS_LOG"
+        exit 1
+    }
+
+    grep -q "^CREATE_FUNCTION_ZIP_EXISTS:" "$AWS_LOG" || {
+        echo "FAIL: Expected lambda.zip to exist during pwsh create-function"
+        cat "$AWS_LOG"
+        exit 1
+    }
+
+    grep -q "^CREATE_FUNCTION_MAIN_EXISTS:" "$AWS_LOG" || {
+        echo "FAIL: Expected main.py to exist during pwsh create-function"
+        cat "$AWS_LOG"
+        exit 1
+    }
+
+    grep -q "^ZIP_ENTRY_MAIN_OK:" "$AWS_LOG" || {
+        echo "FAIL: Expected lambda.zip to contain main.py at root in pwsh"
+        cat "$AWS_LOG"
+        exit 1
+    }
+
+    policy_dir="$(dirname "${policy_doc#file://}")"
+    if [ -d "$policy_dir" ]; then
+        echo "FAIL: Expected pwsh temp dir ($policy_dir) to be deleted after cleanup"
         exit 1
     fi
 
@@ -334,6 +494,16 @@ if grep -q "iam delete-role" "$AWS_LOG"; then
     echo "FAIL: Unexpected iam delete-role after iam create-role failed"
     cat "$AWS_LOG"
     exit 1
+fi
+
+policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+if [ -n "$policy_doc" ]; then
+    policy_dir="${policy_doc#file://}"
+    policy_dir="$(dirname "$policy_dir")"
+    if [ -d "$policy_dir" ]; then
+        echo "FAIL: Expected temp dir ($policy_dir) to be deleted after iam failure"
+        exit 1
+    fi
 fi
 
 for f in trust-policy.json main.py lambda.zip; do
@@ -646,8 +816,86 @@ if command -v pwsh >/dev/null 2>&1; then
     echo "PASS: PowerShell runner IAM delete-role failure after create failure was listed as leftover."
 fi
 
-# Test 12: Bash runner - IAM role deletion detaches attached policies and deletes inline policies first
-echo "=== Test 12: Bash runner - IAM role deletion detaches and deletes policies first ==="
+# Test 12: Bash runner - Lambda build artifacts written in temp dir under mktemp instead of working directory
+echo "=== Test 12: Bash runner - Lambda build artifacts written in temp dir under mktemp ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/bash_lambda_mktemp.log"
+CWD_TEST_BASH="${TEST_TMP}/cwd_bash"
+mkdir -p "$CWD_TEST_BASH"
+
+(
+    cd "$CWD_TEST_BASH"
+    FAIL_LAMBDA_CREATE=0 LAMBDA_ROLE_WAIT=0 WAIT_SECONDS=1 bash "${REPO_DIR}/run_and_cleanup.sh" --only lambda > "$LOG_OUT" 2>&1
+)
+
+for f in trust-policy.json main.py lambda.zip; do
+    if [ -f "${CWD_TEST_BASH}/$f" ] || [ -f "${REPO_DIR}/$f" ]; then
+        echo "FAIL: Lambda artifact $f found in working directory or repo root"
+        exit 1
+    fi
+done
+
+policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+zip_arg=$(grep "lambda create-function --function-name" "$AWS_LOG" | sed -n 's/.*--zip-file \([^ ]*\).*/\1/p' | head -n1)
+
+case "${policy_doc#file://}" in
+    "${CWD_TEST_BASH}"/*|"${REPO_DIR}"/*)
+        echo "FAIL: Policy doc was created inside working directory: $policy_doc"
+        exit 1
+        ;;
+esac
+
+case "${zip_arg#fileb://}" in
+    "${CWD_TEST_BASH}"/*|"${REPO_DIR}"/*)
+        echo "FAIL: Lambda zip was created inside working directory: $zip_arg"
+        exit 1
+        ;;
+esac
+
+echo "PASS: Bash runner wrote Lambda build artifacts in a temp dir under mktemp."
+
+if command -v pwsh >/dev/null 2>&1; then
+    # Test 13: PowerShell runner - Lambda build artifacts written in temp dir under mktemp instead of working directory
+    echo "=== Test 13: PowerShell runner - Lambda build artifacts written in temp dir under mktemp ==="
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_lambda_mktemp.log"
+    CWD_TEST_PWSH="${TEST_TMP}/cwd_pwsh"
+    mkdir -p "$CWD_TEST_PWSH"
+
+    (
+        cd "$CWD_TEST_PWSH"
+        FAIL_LAMBDA_CREATE=0 LAMBDA_ROLE_WAIT=0 WAIT_SECONDS=1 pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Only lambda > "$LOG_OUT" 2>&1
+    )
+
+    for f in trust-policy.json main.py lambda.zip; do
+        if [ -f "${CWD_TEST_PWSH}/$f" ] || [ -f "${REPO_DIR}/$f" ]; then
+            echo "FAIL: Lambda artifact $f found in working directory or repo root in pwsh"
+            exit 1
+        fi
+    done
+
+    policy_doc=$(grep "iam create-role --role-name" "$AWS_LOG" | sed -n 's/.*--assume-role-policy-document \([^ ]*\).*/\1/p' | head -n1)
+    zip_arg=$(grep "lambda create-function --function-name" "$AWS_LOG" | sed -n 's/.*--zip-file \([^ ]*\).*/\1/p' | head -n1)
+
+    case "${policy_doc#file://}" in
+        "${CWD_TEST_PWSH}"/*|"${REPO_DIR}"/*)
+            echo "FAIL: pwsh policy doc was created inside working directory: $policy_doc"
+            exit 1
+            ;;
+    esac
+
+    case "${zip_arg#fileb://}" in
+        "${CWD_TEST_PWSH}"/*|"${REPO_DIR}"/*)
+            echo "FAIL: pwsh lambda zip was created inside working directory: $zip_arg"
+            exit 1
+            ;;
+    esac
+
+    echo "PASS: PowerShell runner wrote Lambda build artifacts in a temp dir under mktemp."
+fi
+
+# Test 14: Bash runner - IAM role deletion detaches attached policies and deletes inline policies first
+echo "=== Test 14: Bash runner - IAM role deletion detaches and deletes policies first ==="
 : > "$AWS_LOG"
 LOG_OUT="${TEST_TMP}/bash_role_policy_cleanup.log"
 
@@ -687,9 +935,9 @@ assert inline_idx < delete_idx, 'delete inline policy must happen before delete-
 
 echo "PASS: Bash runner IAM role deletion detached attached policy and deleted inline policy before delete-role."
 
-# Test 13: PowerShell runner - IAM role deletion detaches attached policies and deletes inline policies first
+# Test 15: PowerShell runner - IAM role deletion detaches attached policies and deletes inline policies first
 if command -v pwsh >/dev/null 2>&1; then
-    echo "=== Test 13: PowerShell runner - IAM role deletion detaches and deletes policies first ==="
+    echo "=== Test 15: PowerShell runner - IAM role deletion detaches and deletes policies first ==="
     : > "$AWS_LOG"
     LOG_OUT="${TEST_TMP}/pwsh_role_policy_cleanup.log"
 
