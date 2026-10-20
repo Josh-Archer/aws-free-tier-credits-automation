@@ -56,6 +56,10 @@ case "$cmd" in
                 echo "i-REDACTED_TEST_EC2"
                 exit 0
                 ;;
+            describe-instances)
+                echo '{"Reservations": []}'
+                exit 0
+                ;;
             terminate-instances)
                 if [ "${EC2_TERMINATE_FAIL:-0}" = "1" ]; then
                     echo "An error occurred (UnauthorizedOperation) when terminating" >&2
@@ -92,11 +96,33 @@ case "$cmd" in
             delete-budget)
                 exit 0
                 ;;
+            list-tags-for-resource)
+                echo '{"ResourceTags": []}'
+                exit 0
+                ;;
         esac
         ;;
     iam)
         case "$sub" in
+            list-roles)
+                echo '{"Roles": []}'
+                exit 0
+                ;;
             create-role)
+                exit 0
+                ;;
+            list-attached-role-policies)
+                echo '{"AttachedPolicies": []}'
+                exit 0
+                ;;
+            detach-role-policy)
+                exit 0
+                ;;
+            list-role-policies)
+                echo '{"PolicyNames": []}'
+                exit 0
+                ;;
+            delete-role-policy)
                 exit 0
                 ;;
             delete-role)
@@ -111,6 +137,10 @@ case "$cmd" in
                 exit 0
                 ;;
             create-function)
+                exit 0
+                ;;
+            list-tags)
+                echo '{"Tags": {}}'
                 exit 0
                 ;;
             delete-function)

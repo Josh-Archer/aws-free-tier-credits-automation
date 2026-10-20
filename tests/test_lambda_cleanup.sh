@@ -26,8 +26,32 @@ case "$cmd" in
             exit 0
         fi
         ;;
+    ec2)
+        case "$sub" in
+            describe-regions)
+                echo '{"Regions": []}'
+                exit 0
+                ;;
+            describe-instances)
+                echo '{"Reservations": []}'
+                exit 0
+                ;;
+        esac
+        ;;
+    rds)
+        case "$sub" in
+            describe-db-instances)
+                echo '{"DBInstances": []}'
+                exit 0
+                ;;
+        esac
+        ;;
     iam)
         case "$sub" in
+            list-roles)
+                echo '{"Roles": []}'
+                exit 0
+                ;;
             create-role)
                 if [ "${FAIL_IAM_ROLE_CREATE:-0}" = "1" ]; then
                     echo "An error occurred (AccessDenied) when calling the CreateRole operation" >&2
@@ -43,6 +67,28 @@ case "$cmd" in
                             ;;
                     esac
                 done
+                exit 0
+                ;;
+            list-attached-role-policies)
+                if [ "${IAM_HAS_ATTACHED_POLICIES:-0}" = "1" ]; then
+                    echo '{"AttachedPolicies": [{"PolicyArn": "arn:aws:iam::123456789012:policy/test-attached-policy"}]}'
+                    exit 0
+                fi
+                echo '{"AttachedPolicies": []}'
+                exit 0
+                ;;
+            detach-role-policy)
+                exit 0
+                ;;
+            list-role-policies)
+                if [ "${IAM_HAS_INLINE_POLICIES:-0}" = "1" ]; then
+                    echo '{"PolicyNames": ["test-inline-policy"]}'
+                    exit 0
+                fi
+                echo '{"PolicyNames": []}'
+                exit 0
+                ;;
+            delete-role-policy)
                 exit 0
                 ;;
             delete-role)
@@ -83,6 +129,10 @@ case "$cmd" in
                 done
                 exit 0
                 ;;
+            list-tags)
+                echo '{"Tags": {}}'
+                exit 0
+                ;;
             delete-function)
                 if [ "${FAIL_LAMBDA_DELETE:-0}" = "1" ]; then
                     echo "An error occurred (AccessDeniedException) when calling the DeleteFunction operation" >&2
@@ -92,6 +142,18 @@ case "$cmd" in
                     echo "An error occurred (ResourceNotFoundException) when calling the DeleteFunction operation: Function not found" >&2
                     exit 1
                 fi
+                exit 0
+                ;;
+        esac
+        ;;
+    budgets)
+        case "$sub" in
+            describe-budgets)
+                echo '{"Budgets": []}'
+                exit 0
+                ;;
+            list-tags-for-resource)
+                echo '{"ResourceTags": []}'
                 exit 0
                 ;;
         esac
@@ -830,6 +892,89 @@ if command -v pwsh >/dev/null 2>&1; then
     esac
 
     echo "PASS: PowerShell runner wrote Lambda build artifacts in a temp dir under mktemp."
+fi
+
+# Test 14: Bash runner - IAM role deletion detaches attached policies and deletes inline policies first
+echo "=== Test 14: Bash runner - IAM role deletion detaches and deletes policies first ==="
+: > "$AWS_LOG"
+LOG_OUT="${TEST_TMP}/bash_role_policy_cleanup.log"
+
+IAM_HAS_ATTACHED_POLICIES=1 \
+IAM_HAS_INLINE_POLICIES=1 \
+FAIL_LAMBDA_CREATE=0 \
+LAMBDA_ROLE_WAIT=0 \
+WAIT_SECONDS=1 \
+bash "${REPO_DIR}/run_and_cleanup.sh" --only lambda > "$LOG_OUT" 2>&1
+
+grep -q "detach-role-policy" "$AWS_LOG" || {
+    echo "FAIL: Expected detach-role-policy in aws log"
+    cat "$AWS_LOG"
+    exit 1
+}
+grep -q "delete-role-policy" "$AWS_LOG" || {
+    echo "FAIL: Expected delete-role-policy in aws log"
+    cat "$AWS_LOG"
+    exit 1
+}
+grep -q "delete-role" "$AWS_LOG" || {
+    echo "FAIL: Expected delete-role in aws log"
+    cat "$AWS_LOG"
+    exit 1
+}
+
+# Verify order: detach-role-policy and delete-role-policy before delete-role
+python3 -c "
+with open('${AWS_LOG}') as f:
+    lines = [l.strip() for l in f]
+detach_idx = next(i for i, l in enumerate(lines) if 'detach-role-policy' in l)
+inline_idx = next(i for i, l in enumerate(lines) if 'delete-role-policy' in l)
+delete_idx = next(i for i, l in enumerate(lines) if 'iam delete-role ' in l)
+assert detach_idx < delete_idx, 'detach must happen before delete-role'
+assert inline_idx < delete_idx, 'delete inline policy must happen before delete-role'
+"
+
+echo "PASS: Bash runner IAM role deletion detached attached policy and deleted inline policy before delete-role."
+
+# Test 15: PowerShell runner - IAM role deletion detaches attached policies and deletes inline policies first
+if command -v pwsh >/dev/null 2>&1; then
+    echo "=== Test 15: PowerShell runner - IAM role deletion detaches and deletes policies first ==="
+    : > "$AWS_LOG"
+    LOG_OUT="${TEST_TMP}/pwsh_role_policy_cleanup.log"
+
+    IAM_HAS_ATTACHED_POLICIES=1 \
+    IAM_HAS_INLINE_POLICIES=1 \
+    FAIL_LAMBDA_CREATE=0 \
+    LAMBDA_ROLE_WAIT=0 \
+    WAIT_SECONDS=1 \
+    pwsh -File "${REPO_DIR}/run_and_cleanup.ps1" -Only lambda > "$LOG_OUT" 2>&1
+
+    grep -q "detach-role-policy" "$AWS_LOG" || {
+        echo "FAIL: Expected detach-role-policy in pwsh aws log"
+        cat "$AWS_LOG"
+        exit 1
+    }
+    grep -q "delete-role-policy" "$AWS_LOG" || {
+        echo "FAIL: Expected delete-role-policy in pwsh aws log"
+        cat "$AWS_LOG"
+        exit 1
+    }
+    grep -q "iam delete-role " "$AWS_LOG" || {
+        echo "FAIL: Expected delete-role in pwsh aws log"
+        cat "$AWS_LOG"
+        exit 1
+    }
+
+    python3 -c "
+with open('${AWS_LOG}') as f:
+    lines = [l.strip() for l in f]
+detach_idx = next(i for i, l in enumerate(lines) if 'detach-role-policy' in l)
+inline_idx = next(i for i, l in enumerate(lines) if 'delete-role-policy' in l)
+delete_idx = next(i for i, l in enumerate(lines) if 'iam delete-role ' in l)
+assert detach_idx < delete_idx, 'pwsh detach must happen before delete-role'
+assert inline_idx < delete_idx, 'pwsh delete inline policy must happen before delete-role'
+"
+
+    echo "PASS: PowerShell runner IAM role deletion detached attached policy and deleted inline policy before delete-role."
 fi
 
 echo "All lambda cleanup tests passed successfully!"

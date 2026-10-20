@@ -8,12 +8,13 @@ function Invoke-TaskBudgetCheck {
 function Invoke-TaskBudgetProvision {
     Write-Host "Creating AWS Budget..."
     $budgetName = "freetier-budget-$(Get-Random)"
+    $runId = if ($script:RunId) { $script:RunId } elseif ($env:RUN_ID) { $env:RUN_ID } else { "run-$(Get-Random)" }
     if ($null -ne $script:CurrentTaskState) {
         $script:CurrentTaskState["BudgetName"] = $budgetName
     }
     $account = $script:TaskAccountId
     $budgetDef = '{"BudgetName":"' + $budgetName + '","BudgetLimit":{"Amount":"10","Unit":"USD"},"TimeUnit":"MONTHLY","BudgetType":"COST"}'
-    aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers "[]" | Out-Null
+    aws budgets create-budget --account-id $account --budget $budgetDef --notifications-with-subscribers "[]" --resource-tags "Key=freetier-run-id,Value=$runId" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Failed to create Budget: $budgetName" -ForegroundColor Red
         if ($null -ne $script:CurrentTaskState) {
